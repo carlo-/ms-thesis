@@ -2,9 +2,11 @@ scikit-learn
 pandas
 joblib
 tqdm
-gym
+git+https://github.com/carlo-/gym@92d7362452d783809b05110562b81bfd82679a8b#egg=gym
 cffi
 mujoco_py
 matplotlib
 numpy
 scipy
+stable-baselines
+mpi4py
