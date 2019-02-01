@@ -1,10 +1,11 @@
 import os
 
+import numpy as np
 import tensorflow as tf
 
 from stable_baselines.bench import Monitor
 from stable_baselines.sac import MlpPolicy
-from stable_baselines.common.vec_env import DummyVecEnv
+from stable_baselines.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines import SAC
 
 import gym
@@ -27,23 +28,38 @@ def init_env(seed=0, reward_params=None):
     return _init
 
 
-def train(reward_params, sac_params, steps, model_path, seed=42, tb_log_name='SAC'):
+def train(reward_params, sac_params, steps, model_path, seed=42, tb_log_name='SAC',
+          normalize_obs=False, vec_normalize_dir=None):
 
     tb_dir = f'{OUT_DIR}/tensorboard/'
     os.makedirs(tb_dir, exist_ok=True)
 
     env = DummyVecEnv([init_env(seed=seed, reward_params=reward_params)])
-    raw_env = env.unwrapped # type: FetchPickAndPlaceEnv
+
+    if normalize_obs:
+        assert vec_normalize_dir is not None
+        os.makedirs(vec_normalize_dir, exist_ok=True)
+        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
+        raw_env = env.venv.envs[0].unwrapped  # type: FetchPickAndPlaceEnv
+    else:
+        raw_env = env.unwrapped  # type: FetchPickAndPlaceEnv
+
     assert isinstance(raw_env, FetchPickAndPlaceEnv)
+
+    global original_cumulative_rew
     original_cumulative_rew = 0.0
 
-    def callback(sac_locals, sac_globals):
+    def callback(model_locals, model_globals):
         global original_cumulative_rew
 
-        step = sac_locals.get('step') # type: int
-        writer = sac_locals.get('writer') # type: tf.summary.FileWriter
-        done = sac_locals.get('done', False)
-        obs = sac_locals.get('obs')
+        step = model_locals.get('step') # type: int
+        writer = model_locals.get('writer') # type: tf.summary.FileWriter
+        done = model_locals.get('done', False)
+
+        if normalize_obs:
+            obs = env.old_obs[0].copy()
+        else:
+            obs = model_locals.get('obs')
 
         achieved_goal = obs[3:6]
         original_rew = -fetch_env_goal_distance(achieved_goal, raw_env.goal)
@@ -58,6 +74,9 @@ def train(reward_params, sac_params, steps, model_path, seed=42, tb_log_name='SA
     model = SAC(MlpPolicy, env, verbose=1, tensorboard_log=tb_dir, **sac_params)
     model.learn(total_timesteps=steps, tb_log_name=tb_log_name, callback=callback)
     model.save(model_path)
+
+    if normalize_obs:
+        env.save_running_average(vec_normalize_dir)
 
 
 def train_configs(config_index=None, play_only=False):
@@ -81,6 +100,11 @@ def train_configs(config_index=None, play_only=False):
         dict(
             name='alpha0.1a_k1.5_c1_md0.03',
             reward_params=dict(k=1.5, c=1.0, min_dist=0.03),
+            sac_params=dict(ent_coef='auto_0.1')
+        ),
+        dict(
+            name='alpha0.1a_k1_c0.1_md0.03',
+            reward_params=dict(k=1.0, c=0.1, min_dist=0.03),
             sac_params=dict(ent_coef='auto_0.1')
         ),
     ]
@@ -126,4 +150,4 @@ if __name__ == '__main__':
     # main()
 
     # should be able to do 1M steps with 4 workers in approx 2h
-    train_configs(3, play_only=True)
+    train_configs(4)

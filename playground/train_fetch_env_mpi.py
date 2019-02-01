@@ -16,12 +16,12 @@ from gym.wrappers import FlattenDictWrapper
 from gym.envs.robotics import FetchEnv
 
 
-def make_env(seed, rank, monitor=True):
+def make_env(seed, rank, monitor=True, reward_params=None):
     set_global_seeds(seed)
 
     env = gym.make('FetchPickAndPlaceDense-v1')
     raw_env = env.unwrapped # type: FetchEnv
-    raw_env.reward_params = dict(k=1.0, c=1.0)
+    raw_env.reward_params = reward_params or dict(k=1.0, c=1.0)
 
     env = FlattenDictWrapper(env, dict_keys=['observation', 'desired_goal'])
     # env = Monitor(env, os.path.join(logger.get_dir(), str(rank)), allow_early_resets=True)
@@ -35,7 +35,7 @@ def make_env(seed, rank, monitor=True):
     return env
 
 
-def train(num_timesteps, seed, model_path, tensorboard_log):
+def train(num_timesteps, seed, model_path, tensorboard_log, reward_params=None):
 
     with tf_util.single_threaded_session():
 
@@ -48,7 +48,7 @@ def train(num_timesteps, seed, model_path, tensorboard_log):
             logger.set_level(logger.DISABLED)
 
         worker_seed = seed + 10000 * rank
-        env = make_env(worker_seed, rank)
+        env = make_env(worker_seed, rank, monitor=False, reward_params=reward_params)
 
         policy_kwargs = dict()
 
@@ -93,6 +93,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
-    # train(num_timesteps=1e6, seed=42, model_path='./model', tensorboard_log=None)
-    # play('../model_5.pkl')
+    # main()
+    # train(num_timesteps=5_000_000, seed=42, model_path='../out/model_trpo2.pkl', tensorboard_log='../out/tensorboard2',
+    #       reward_params=dict(k=2.0, c=1.0))
+    play('../out/model_trpo2.pkl_0.pkl')
