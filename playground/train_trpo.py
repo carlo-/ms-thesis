@@ -126,7 +126,7 @@ def train_configs(config_index=None, play_only=False, steps=0, load_with_suffix=
         tb_name = f'TRPO_{conf["name"]}'
         seed = 42
         if play_only:
-            play(model_path, conf['reward_params'])
+            play(load_path_first, conf['reward_params'])
         else:
             normalize_obs = conf.get('normalize_obs', False)
             vec_normalize_dir = f'{OUT_DIR}/fetch_trpo_vec_norm_{conf["name"]}_s5M'
