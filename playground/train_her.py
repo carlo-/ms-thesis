@@ -1,5 +1,6 @@
 import os
 import pickle
+import itertools as it
 
 import gym
 from baselines.bench import Monitor
@@ -9,8 +10,9 @@ from baselines.her.ddpg import DDPG
 from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 
 
-TRAIN = True
-OUT_DIR = '../out/ddpg'
+TRAIN = False
+SAVE_GIF = True
+OUT_DIR = '../out/ddpg2'
 LOG_DIR = f'{OUT_DIR}/log'
 MODEL_DIR = f'{OUT_DIR}/models'
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -59,13 +61,22 @@ def play(model_path):
     model = load_policy(model_path)
     env = init_env()
     obs = env.reset()
+    images = []
 
-    while True:
+    for i in it.count():
         actions = model.step(obs)[0]
         obs, _, done, _ = env.step(actions)
-        env.render()
+        img = env.render(mode='rgb_array')
+        if SAVE_GIF:
+            images.append(img)
+            if i == 240:
+                break
         if done:
             obs = env.reset()
+
+    if SAVE_GIF:
+        import imageio
+        imageio.mimwrite(f'{OUT_DIR}/out.gif', images, fps=60)
 
 
 def main():
@@ -88,4 +99,4 @@ if __name__ == '__main__':
     #     '--save_path=./out/fetch_ddpg_her_model_sparse'
     # ])
     # main()
-    play(os.path.join(MODEL_DIR, 'policy_best.pkl'))
+    play(os.path.join(MODEL_DIR, 'policy_610.pkl'))
