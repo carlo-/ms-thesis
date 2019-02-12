@@ -29,7 +29,12 @@ def set_state(raw_env: FetchPickAndPlaceEnv, sim_state, goal):
     raw_env.goal = goal.copy()
 
 
-def bin_obs(obs):
+def has_grasped_object(raw_env: FetchPickAndPlaceEnv):
+    pts = raw_env.get_object_contact_points()
+    return len(pts) > 5
+
+
+def bin_obs(obs, raw_env):
     if not isinstance(obs, np.ndarray):
         obs = obs['observation']
     gripper_pos = obs[:3]
@@ -38,6 +43,7 @@ def bin_obs(obs):
 
     dig1 = np.digitize(np.r_[gripper_pos, object_pos], POS_BINS, right=False)
     dig2 = np.digitize(gripper_state, GRIPPER_BINS, right=False)
+    # dig2 = int(has_grasped_object(raw_env))
     return tuple(np.r_[dig1, dig2])
 
 
@@ -48,7 +54,7 @@ class Cell:
         if obs is None or reward is None:
             raise ValueError
         self.obs = obs
-        self.binned_obs = bin_obs(obs)
+        self.binned_obs = bin_obs(obs, raw_env)
         self.reward = reward
 
         self.root_cell = root_cell
@@ -80,7 +86,7 @@ class Cell:
         a = 1. / (self.n_chosen + 0.001)
         b = 1. / (self.n_visited_in_expl + 0.001)
         c = 1. / (self.n_children_updated + 0.001)
-        return a + b + c + 1.0
+        return a + b + c + 1.0 # 2.0 + self.reward
 
 
 def phase1():
@@ -93,7 +99,7 @@ def phase1():
     action_space = env.action_space
     all_archives = []
 
-    for r in range(10):
+    for r in range(1):
 
         obs = env.reset()
         init_reward = raw_env.compute_reward(obs['achieved_goal'], raw_env.goal, {})
@@ -105,7 +111,7 @@ def phase1():
         archive[root_cell.binned_obs] = root_cell
         weights[root_cell.binned_obs] = root_cell.weight
 
-        for _ in tqdm(range(5_000)):
+        for _ in tqdm(range(20_000)):
             probs = np.asarray(list(weights.values()))
             probs /= probs.sum()
 
@@ -119,8 +125,11 @@ def phase1():
             # root_cell = cell.root_cell or cell
             traj = list(sel_cell.trajectory)
 
-            for _ in range(50):
-                a = action_space.sample()
+            a = np.zeros(action_space.shape)
+            for s in range(50):
+                if s % 2 == 0:
+                    a = action_space.sample()
+                a = a.copy()
                 obs, reward, _, _ = env.step(a)
                 traj.append(a)
 
@@ -128,7 +137,7 @@ def phase1():
                     env.render()
 
                 add_to_archive = True
-                binned = bin_obs(obs)
+                binned = bin_obs(obs, raw_env)
 
                 if binned in archive:
                     # print('Already in archive!')
@@ -138,7 +147,7 @@ def phase1():
                     weights[binned] = existing_cell.weight
 
                     shorter_traj = len(traj) < len(existing_cell.trajectory)
-                    higher_rew = reward > existing_cell.reward
+                    higher_rew = (existing_cell.reward - reward) / (reward + 1e-5) >= 0.01
                     add_to_archive = shorter_traj or higher_rew
                     # if add_to_archive:
                     #     print('Better!')
@@ -151,6 +160,8 @@ def phase1():
                     weights[binned] = new_cell.weight
 
             weights[sel_cell.binned_obs] = sel_cell.weight
+
+        print('Final archive len:', len(archive))
 
         best_cell = None
         best_reward = -np.inf
