@@ -11,8 +11,16 @@ from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 
 
 TRAIN = False
-SAVE_GIF = True
+SAVE_GIF = False
+
+# ENV_ID = 'MovingHandReach-v0'
+# ENV_KWARGS = dict(ignore_target_rotation=True)
+# OUT_DIR = '../out/ddpg_moving_hand_v1'
+
+ENV_ID = 'FetchPickAndPlace-v1'
+ENV_KWARGS = dict()
 OUT_DIR = '../out/ddpg2'
+
 LOG_DIR = f'{OUT_DIR}/log'
 MODEL_DIR = f'{OUT_DIR}/models'
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -20,7 +28,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 
 def init_env(seed=0):
-    env = gym.make('FetchPickAndPlace-v1')
+    env = gym.make(ENV_ID, **ENV_KWARGS)
     env.seed(seed)
     env = Monitor(env,
                   logger.get_dir() and os.path.join(logger.get_dir(), '0.0'),
@@ -66,11 +74,13 @@ def play(model_path):
     for i in it.count():
         actions = model.step(obs)[0]
         obs, _, done, _ = env.step(actions)
-        img = env.render(mode='rgb_array')
         if SAVE_GIF:
+            img = env.render(mode='rgb_array')
             images.append(img)
             if i == 240:
                 break
+        else:
+            env.render()
         if done:
             obs = env.reset()
 
@@ -86,17 +96,13 @@ def main():
     if TRAIN:
         train(MODEL_DIR)
 
-    best_model_path = os.path.join(MODEL_DIR, 'policy_latest.pkl')
-    if os.path.exists(best_model_path):
-        play(best_model_path)
+    latest_model_path = os.path.join(MODEL_DIR, 'policy_latest.pkl')
+    if os.path.exists(latest_model_path):
+        play(latest_model_path)
 
 
 if __name__ == '__main__':
-    # run_main([
-    #     '--alg=her',
-    #     '--env=FetchPickAndPlace-v1',
-    #     '--num_timesteps=5000000',
-    #     '--save_path=./out/fetch_ddpg_her_model_sparse'
-    # ])
-    # main()
-    play(os.path.join(MODEL_DIR, 'policy_610.pkl'))
+    main()
+
+    # play(os.path.join(MODEL_DIR, 'policy_610.pkl'))
+    # play(os.path.join(MODEL_DIR, 'policy_375.pkl'))
