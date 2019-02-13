@@ -2,7 +2,7 @@ scikit-learn
 pandas
 joblib
 tqdm
-git+https://github.com/carlo-/gym@dc57e0f1169387049eee490247f8278ff01d29b5#egg=gym
+git+https://github.com/carlo-/gym@75d4736f3b7fd4366cfc0492ca73e318861b60e4#egg=gym
 cffi
 mujoco_py
 matplotlib
@@ -10,3 +10,5 @@ numpy
 scipy
 stable-baselines
 mpi4py
+ray[rllib]
+ray[debug]
