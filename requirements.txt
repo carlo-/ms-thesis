@@ -12,3 +12,5 @@ stable-baselines
 mpi4py
 ray[rllib]
 ray[debug]
+pybullet
+-e git+https://github.com/benelot/pybullet-gym.git#egg=pybulletgym
