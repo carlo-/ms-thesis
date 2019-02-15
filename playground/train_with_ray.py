@@ -23,8 +23,22 @@ def fetch_env_creator(env_config):
     return env
 
 
+def register_bullet_envs():
+    import pybulletgym.envs
+    bullet_envs = filter(lambda x: "Bullet" in x, gym.envs.registration.registry.env_specs)
+    for env_id in bullet_envs:
+        def make(*args):
+            # this will be called by a different process, so we need to import
+            # to make sure that the PyBullet envs are registered in that context
+            import gym
+            import pybulletgym.envs
+            return gym.make(env_id)
+        register_env(env_id, make)
+
+
 custom_fetch_env_id = "custom_fetch"
 register_env(custom_fetch_env_id, fetch_env_creator)
+register_bullet_envs()
 
 
 def get_ddpg_config(env_id, env_config=None):
@@ -130,32 +144,32 @@ def main(rollout_only=False):
         #     ),
         # ),
 
-        tune.Experiment(
-            name='fetch_huber_ppo_gae',
-            run='PPO',
-            stop=dict(training_iteration=1_000),
-            local_dir=OUT_DIR,
-            checkpoint_freq=10,
-            config={
-                'env': custom_fetch_env_id,
-                'env_config': dict(
-                    reward_params=dict(huber_loss=True)
-                ),
-                'gamma': 0.995,
-                'lambda': 0.95,
-                'clip_param': 0.2,
-                'kl_coeff': 1.0,
-                'num_sgd_iter': 20,
-                'lr': .0001,
-                'sgd_minibatch_size': 3276,
-                'horizon': 5000,
-                'train_batch_size': 32000,
-                'model': {'free_log_std': True},
-                'num_workers': 6,
-                'num_gpus': 1,
-                'batch_mode': 'complete_episodes'
-            },
-        ),
+        # tune.Experiment(
+        #     name='fetch_huber_ppo_gae',
+        #     run='PPO',
+        #     stop=dict(training_iteration=1_000),
+        #     local_dir=OUT_DIR,
+        #     checkpoint_freq=10,
+        #     config={
+        #         'env': custom_fetch_env_id,
+        #         'env_config': dict(
+        #             reward_params=dict(huber_loss=True)
+        #         ),
+        #         'gamma': 0.995,
+        #         'lambda': 0.95,
+        #         'clip_param': 0.2,
+        #         'kl_coeff': 1.0,
+        #         'num_sgd_iter': 20,
+        #         'lr': .0001,
+        #         'sgd_minibatch_size': 3276,
+        #         'horizon': 5000,
+        #         'train_batch_size': 32000,
+        #         'model': {'free_log_std': True},
+        #         'num_workers': 6,
+        #         'num_gpus': 1,
+        #         'batch_mode': 'complete_episodes'
+        #     },
+        # ),
 
         # tune.Experiment(
         #     name='humanoid_ppo_gae',
@@ -180,6 +194,30 @@ def main(rollout_only=False):
         #         'batch_mode': 'complete_episodes'
         #     },
         # ),
+
+        tune.Experiment(
+            name='bullet_humanoid_ppo_gae',
+            run='PPO',
+            stop=dict(time_total_s=3600*8, training_iteration=10_000),
+            local_dir=OUT_DIR,
+            checkpoint_freq=100,
+            config={
+                'env': 'HumanoidPyBulletEnv-v0',
+                'gamma': 0.995,
+                'lambda': 0.95,
+                'clip_param': 0.2,
+                'kl_coeff': 1.0,
+                'num_sgd_iter': 20,
+                'lr': .0001,
+                'sgd_minibatch_size': 3276,
+                'horizon': 5000,
+                'train_batch_size': 32000,
+                'model': {'free_log_std': True},
+                'num_workers': 20,
+                'num_gpus': 1,
+                'batch_mode': 'complete_episodes'
+            },
+        ),
     ]
 
     if rollout_only:
@@ -190,4 +228,4 @@ def main(rollout_only=False):
 
 
 if __name__ == '__main__':
-    main(rollout_only=True)
+    main()
