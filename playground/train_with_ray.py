@@ -1,4 +1,5 @@
 import os
+from time import sleep
 
 import gym
 import ray
@@ -73,14 +74,16 @@ def rollout(*, agent_type=None, agent_config=None, checkpoint_path=None, experim
         agent_config = experiment.spec["config"]
         env_id = agent_config['env']
 
-        exp_dir = f'{experiment.spec["local_dir"]}/{experiment.name}'
-        checkpoints = glob.glob(f'{exp_dir}/{agent_type}_{env_id}_*/checkpoint_*/checkpoint-*[0-9]')
-        assert len(checkpoints) > 0, "No checkpoints found!"
-        checkpoint_path = sorted(checkpoints, key=os.path.getmtime)[-1]
+        if checkpoint_path is None:
+            exp_dir = f'{experiment.spec["local_dir"]}/{experiment.name}'
+            checkpoints = glob.glob(f'{exp_dir}/{agent_type}_{env_id}_*/checkpoint_*/checkpoint-*[0-9]')
+            assert len(checkpoints) > 0, "No checkpoints found!"
+            checkpoint_path = sorted(checkpoints, key=os.path.getmtime)[-1]
 
     if agent is None:
         from ray.rllib.agents.registry import get_agent_class
         cls = get_agent_class(agent_type)
+        agent_config['num_workers'] = 1
         agent = cls(env=env_id, config=agent_config)
         agent.restore(checkpoint_path)
         print('Restored checkpoint at:', checkpoint_path)
@@ -97,8 +100,10 @@ def rollout(*, agent_type=None, agent_config=None, checkpoint_path=None, experim
     else:
         use_lstm = False
 
+    if 'Bullet' in env_id:
+        env.render(mode='human')
+
     steps = 0
-    reward_total = 0.0
     while steps < (num_steps or steps + 1):
         state = env.reset()
         done = False
@@ -111,10 +116,11 @@ def rollout(*, agent_type=None, agent_config=None, checkpoint_path=None, experim
                 action = agent.compute_action(state)
             next_state, reward, done, _ = env.step(action)
             reward_total += reward
-            env.render()
+            env.render(mode='human')
             steps += 1
             state = next_state
-    print("Episode reward", reward_total)
+            sleep(1/60)
+        print("Episode reward", reward_total)
 
 
 def main(rollout_only=False):
@@ -144,32 +150,32 @@ def main(rollout_only=False):
         #     ),
         # ),
 
-        # tune.Experiment(
-        #     name='fetch_huber_ppo_gae',
-        #     run='PPO',
-        #     stop=dict(training_iteration=1_000),
-        #     local_dir=OUT_DIR,
-        #     checkpoint_freq=10,
-        #     config={
-        #         'env': custom_fetch_env_id,
-        #         'env_config': dict(
-        #             reward_params=dict(huber_loss=True)
-        #         ),
-        #         'gamma': 0.995,
-        #         'lambda': 0.95,
-        #         'clip_param': 0.2,
-        #         'kl_coeff': 1.0,
-        #         'num_sgd_iter': 20,
-        #         'lr': .0001,
-        #         'sgd_minibatch_size': 3276,
-        #         'horizon': 5000,
-        #         'train_batch_size': 32000,
-        #         'model': {'free_log_std': True},
-        #         'num_workers': 6,
-        #         'num_gpus': 1,
-        #         'batch_mode': 'complete_episodes'
-        #     },
-        # ),
+        tune.Experiment(
+            name='fetch_huber_ppo_gae',
+            run='PPO',
+            stop=dict(time_total_s=3600*8, training_iteration=10_000),
+            local_dir=OUT_DIR,
+            checkpoint_freq=10,
+            config={
+                'env': custom_fetch_env_id,
+                'env_config': dict(
+                    reward_params=dict(huber_loss=True)
+                ),
+                'gamma': 0.995,
+                'lambda': 0.95,
+                'clip_param': 0.2,
+                'kl_coeff': 1.0,
+                'num_sgd_iter': 20,
+                'lr': .0001,
+                'sgd_minibatch_size': 32768,
+                'horizon': 5000,
+                'train_batch_size': 320000,
+                'model': {'free_log_std': True},
+                'num_workers': 20,
+                'num_gpus': 4,
+                'batch_mode': 'complete_episodes'
+            },
+        ),
 
         # tune.Experiment(
         #     name='humanoid_ppo_gae',
@@ -195,34 +201,34 @@ def main(rollout_only=False):
         #     },
         # ),
 
-        tune.Experiment(
-            name='bullet_humanoid_ppo_gae',
-            run='PPO',
-            stop=dict(time_total_s=3600*8, training_iteration=10_000),
-            local_dir=OUT_DIR,
-            checkpoint_freq=100,
-            config={
-                'env': 'HumanoidPyBulletEnv-v0',
-                'gamma': 0.995,
-                'lambda': 0.95,
-                'clip_param': 0.2,
-                'kl_coeff': 1.0,
-                'num_sgd_iter': 20,
-                'lr': .0001,
-                'sgd_minibatch_size': 3276,
-                'horizon': 5000,
-                'train_batch_size': 32000,
-                'model': {'free_log_std': True},
-                'num_workers': 20,
-                'num_gpus': 1,
-                'batch_mode': 'complete_episodes'
-            },
-        ),
+        # tune.Experiment(
+        #     name='bullet_humanoid_ppo_gae',
+        #     run='PPO',
+        #     stop=dict(time_total_s=3600*8, training_iteration=10_000),
+        #     local_dir=OUT_DIR,
+        #     checkpoint_freq=100,
+        #     config={
+        #         'env': 'HumanoidPyBulletEnv-v0',
+        #         'gamma': 0.995,
+        #         'lambda': 0.95,
+        #         'clip_param': 0.2,
+        #         'kl_coeff': 1.0,
+        #         'num_sgd_iter': 20,
+        #         'lr': .0001,
+        #         'sgd_minibatch_size': 3276,
+        #         'horizon': 5000,
+        #         'train_batch_size': 32000,
+        #         'model': {'free_log_std': True},
+        #         'num_workers': 20,
+        #         'num_gpus': 1,
+        #         'batch_mode': 'complete_episodes'
+        #     },
+        # ),
     ]
 
     if rollout_only:
         for e in experiments:
-            rollout(experiment=e, num_steps=1000)
+            rollout(experiment=e, num_steps=10_000)
     else:
         tune.run_experiments(experiments)
 
