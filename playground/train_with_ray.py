@@ -13,15 +13,17 @@ os.makedirs(OUT_DIR, exist_ok=True)
 print(OUT_DIR)
 
 
-def fetch_env_creator(env_config):
-    from gym.wrappers import FlattenDictWrapper
-    env = gym.make("FetchPickAndPlaceDense-v1")
-    raw_env = env.unwrapped
-    env_config = env_config or dict()
-    for k, v in env_config.items():
-        setattr(raw_env, k, v)
-    env = FlattenDictWrapper(env, dict_keys=['observation', 'desired_goal'])
-    return env
+def get_fetch_env_creator(env_id):
+    def fetch_env_creator(env_config):
+        from gym.wrappers import FlattenDictWrapper
+        env = gym.make(env_id)
+        raw_env = env.unwrapped
+        env_config = env_config or dict()
+        for k, v in env_config.items():
+            setattr(raw_env, k, v)
+        env = FlattenDictWrapper(env, dict_keys=['observation', 'desired_goal'])
+        return env
+    return fetch_env_creator
 
 
 def register_bullet_envs():
@@ -38,7 +40,9 @@ def register_bullet_envs():
 
 
 custom_fetch_env_id = "custom_fetch"
-register_env(custom_fetch_env_id, fetch_env_creator)
+custom_simple_fetch_env_id = "simple_custom_fetch"
+register_env(custom_fetch_env_id, get_fetch_env_creator("FetchPickAndPlaceDense-v1"))
+register_env(custom_simple_fetch_env_id, get_fetch_env_creator("FetchPickAndPlaceEasyDense-v1"))
 register_bullet_envs()
 
 
@@ -150,16 +154,43 @@ def main(rollout_only=False):
         #     ),
         # ),
 
+        # tune.Experiment(
+        #     name='fetch_huber_ppo_gae',
+        #     run='PPO',
+        #     stop=dict(time_total_s=3600*8, training_iteration=10_000),
+        #     local_dir=OUT_DIR,
+        #     checkpoint_freq=10,
+        #     config={
+        #         'env': custom_fetch_env_id,
+        #         'env_config': dict(
+        #             reward_params=dict(huber_loss=True)
+        #         ),
+        #         'gamma': 0.995,
+        #         'lambda': 0.95,
+        #         'clip_param': 0.2,
+        #         'kl_coeff': 1.0,
+        #         'num_sgd_iter': 20,
+        #         'lr': .0001,
+        #         'sgd_minibatch_size': 32768,
+        #         'horizon': 5000,
+        #         'train_batch_size': 320000,
+        #         'model': {'free_log_std': True},
+        #         'num_workers': 20,
+        #         'num_gpus': 4,
+        #         'batch_mode': 'complete_episodes'
+        #     },
+        # ),
+
         tune.Experiment(
-            name='fetch_huber_ppo_gae',
+            name='fetch_simple_huber_ppo_gae',
             run='PPO',
             stop=dict(time_total_s=3600*8, training_iteration=10_000),
             local_dir=OUT_DIR,
             checkpoint_freq=10,
             config={
-                'env': custom_fetch_env_id,
+                'env': custom_simple_fetch_env_id,
                 'env_config': dict(
-                    reward_params=dict(huber_loss=True)
+                    reward_params=dict(huber_loss=True, c1=0.0)
                 ),
                 'gamma': 0.995,
                 'lambda': 0.95,
