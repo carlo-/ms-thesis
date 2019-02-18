@@ -1,16 +1,35 @@
 import os
 from time import sleep
 
+import numpy as np
 import gym
 import ray
 import ray.tune as tune
 import ray.rllib.agents.ddpg as ddpg
+from ray.rllib.evaluation.episode import MultiAgentEpisode
 from ray.tune.registry import register_env
 
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), '../out/ray')
 os.makedirs(OUT_DIR, exist_ok=True)
 print(OUT_DIR)
+
+
+def fetch_is_success(obs, has_object=True, distance_threshold=0.05):
+    if has_object:
+        achieved = obs[3:6]
+    else:
+        achieved = obs[:3]
+    desired = obs[-3:]
+    d = np.linalg.norm(achieved - desired, axis=-1)
+    return (d < distance_threshold).astype(np.float32)
+
+
+def fetch_on_episode_end(info):
+    episode = info["episode"] # type: MultiAgentEpisode
+    obs = episode.last_observation_for()
+    success = fetch_is_success(obs)
+    episode.custom_metrics["success"] = success
 
 
 def get_fetch_env_creator(env_id):
@@ -192,6 +211,9 @@ def main(rollout_only=False):
                 'env_config': dict(
                     reward_params=dict(huber_loss=True, c1=0.0)
                 ),
+                'callbacks': {
+                    'on_episode_end': tune.function(fetch_on_episode_end),
+                },
                 'gamma': 0.995,
                 'lambda': 0.95,
                 'clip_param': 0.2,
