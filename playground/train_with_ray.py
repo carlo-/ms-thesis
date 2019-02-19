@@ -59,8 +59,10 @@ def register_bullet_envs():
 
 
 custom_fetch_env_id = "custom_fetch"
+custom_fetch_sparse_env_id = "custom_fetch_sparse"
 custom_simple_fetch_env_id = "simple_custom_fetch"
 register_env(custom_fetch_env_id, get_fetch_env_creator("FetchPickAndPlaceDense-v1"))
+register_env(custom_fetch_sparse_env_id, get_fetch_env_creator("FetchPickAndPlace-v1"))
 register_env(custom_simple_fetch_env_id, get_fetch_env_creator("FetchPickAndPlaceEasyDense-v1"))
 register_bullet_envs()
 
@@ -200,33 +202,56 @@ def main(rollout_only=False):
         #     },
         # ),
 
+        # tune.Experiment(
+        #     name='fetch_simple_huber_ppo_gae',
+        #     run='PPO',
+        #     stop=dict(time_total_s=3600*8, training_iteration=10_000),
+        #     local_dir=OUT_DIR,
+        #     checkpoint_freq=10,
+        #     config={
+        #         'env': custom_simple_fetch_env_id,
+        #         'env_config': dict(
+        #             reward_params=dict(huber_loss=True, c1=0.0)
+        #         ),
+        #         'callbacks': {
+        #             'on_episode_end': tune.function(fetch_on_episode_end),
+        #         },
+        #         'gamma': 0.995,
+        #         'lambda': 0.95,
+        #         'clip_param': 0.2,
+        #         'kl_coeff': 1.0,
+        #         'num_sgd_iter': 20,
+        #         'lr': .0001,
+        #         'sgd_minibatch_size': 32768,
+        #         'horizon': 5000,
+        #         'train_batch_size': 320000,
+        #         'model': {'free_log_std': True},
+        #         'num_workers': 20,
+        #         'num_gpus': 4,
+        #         'batch_mode': 'complete_episodes'
+        #     },
+        # ),
+
         tune.Experiment(
-            name='fetch_simple_huber_ppo_gae',
-            run='PPO',
-            stop=dict(time_total_s=3600*8, training_iteration=10_000),
+            name='fetch_sparse_apex_ddpg',
+            run='APEX_DDPG',
+            stop=dict(time_total_s=3600 * 5, training_iteration=10_000),
             local_dir=OUT_DIR,
             checkpoint_freq=10,
             config={
-                'env': custom_simple_fetch_env_id,
-                'env_config': dict(
-                    reward_params=dict(huber_loss=True, c1=0.0)
-                ),
+                'env': custom_fetch_sparse_env_id,
                 'callbacks': {
                     'on_episode_end': tune.function(fetch_on_episode_end),
                 },
-                'gamma': 0.995,
-                'lambda': 0.95,
-                'clip_param': 0.2,
-                'kl_coeff': 1.0,
-                'num_sgd_iter': 20,
-                'lr': .0001,
-                'sgd_minibatch_size': 32768,
-                'horizon': 5000,
-                'train_batch_size': 320000,
-                'model': {'free_log_std': True},
-                'num_workers': 20,
-                'num_gpus': 4,
-                'batch_mode': 'complete_episodes'
+                'clip_rewards': False,
+                'num_workers': 16,
+                'noise_scale': 1.0,
+                'n_step': 3,
+                'target_network_update_freq': 50000,
+                'tau': 0.001,
+                'actor_hiddens': [256, 256, 256],
+                'critic_hiddens': [256, 256, 256],
+                'buffer_size': 1_000_000,
             },
         ),
 
