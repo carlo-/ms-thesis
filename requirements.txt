@@ -2,7 +2,7 @@ scikit-learn
 pandas
 joblib
 tqdm
-git+https://github.com/carlo-/gym@7be6b1335c62a4f1fbb8b8b7a37a678620d2086d#egg=gym
+git+https://github.com/carlo-/gym@e18ecd62e724dbcacb4cf4e5319f3e52341f3075#egg=gym
 cffi
 mujoco_py
 matplotlib
