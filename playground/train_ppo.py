@@ -82,26 +82,39 @@ def train(*, env_id, reward_params, ppo_params, steps, local_dir, seed=42, n_cpu
     model.learn(total_timesteps=steps, callback=callback, tb_log_name='tb')
 
 
-def play(model_path, reward_params=None):
-    raise NotImplementedError
-    env = DummyVecEnv([init_env(seed=42, reward_params=reward_params)])
+def play(*, env_id, run_dir, reward_params=None, epoch):
+
+    model_path = f'{run_dir}/checkpoints/model_{epoch}.pkl'
+    normalizer_dir = f'{run_dir}/normalizer'
+
+    env = DummyVecEnv([init_env(env_id=env_id, seed=42, reward_params=reward_params)])
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=200., training=False)
+    env.load_running_average(normalizer_dir)
+
     model = PPO2.load(model_path, env=env)
+    obs = env.reset()
     while True:
-        obs = env.reset()
-        for _ in range(100):
-            env.render()
-            u = model.predict(obs, deterministic=True)[0]
-            obs, rew, done, info = env.step(u)
-            print(rew)
+        env.render()
+        u = model.predict(obs, deterministic=True)[0]
+        obs, rew, done, info = env.step(u)
+        print(rew)
 
 
 if __name__ == '__main__':
+
     train(
         env_id='FetchPickAndPlaceDense-v1',
         reward_params=dict(stepped=True),
         ppo_params=dict(),
-        steps=10_000_000,
-        local_dir=f'{OUT_DIR}/fetch_stepped_rew',
+        steps=100_000_000,
+        local_dir=f'{OUT_DIR}/fetch_stepped_rew_v2',
         n_cpus=20,
-        checkpoint_freq=20,
+        checkpoint_freq=40,
     )
+
+    # play(
+    #     env_id='FetchPickAndPlaceDense-v1',
+    #     reward_params=dict(stepped=True),
+    #     run_dir=f'{OUT_DIR}/fetch_stepped_rew/mordor',
+    #     epoch=3900,
+    # )
