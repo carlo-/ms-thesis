@@ -1,3 +1,4 @@
+tensorboardX
 scikit-learn
 pandas
 joblib

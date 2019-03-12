@@ -13,10 +13,6 @@ from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 TRAIN = False
 SAVE_GIF = False
 
-# ENV_ID = 'MovingHandReach-v0'
-# ENV_KWARGS = dict(ignore_target_rotation=True)
-# OUT_DIR = '../out/ddpg_moving_hand_v1'
-
 ENV_ID = 'FetchPickAndPlace-v1'
 ENV_KWARGS = dict()
 OUT_DIR = '../out/ddpg2'

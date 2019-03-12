@@ -1,7 +1,10 @@
 import os
+import time
+from datetime import datetime
 
 import numpy as np
 import tensorflow as tf
+from tensorboardX import SummaryWriter
 
 from stable_baselines.bench import Monitor
 from stable_baselines.sac import MlpPolicy
@@ -10,144 +13,137 @@ from stable_baselines import SAC
 
 import gym
 from gym.wrappers import FlattenDictWrapper
-from gym.envs.robotics import FetchPickAndPlaceEnv
-from gym.envs.robotics.fetch_env import goal_distance as fetch_env_goal_distance
+from gym.envs.robotics.fetch_env import FetchEnv, goal_distance as fetch_env_goal_distance
 
 
-TRAIN = True
-OUT_DIR = '../out'
+ALG_NAME = 'sb_sac'
+OUT_DIR = f'../out/{ALG_NAME}'
+REMOTE_OUT_DIR = f'/run/user/1000/gvfs/sftp:host=mordor.csc.kth.se,port=2222,user=carlora/home/carlora/thesis/repo/out/{ALG_NAME}'
+os.makedirs(OUT_DIR, exist_ok=True)
+tb_info = None
 
 
-def init_env(seed=0, reward_params=None):
+def init_env(*, env_id, seed=0, reward_params=None):
     def _init():
-        env = gym.make('FetchPickAndPlaceDense-v1')
-        env.unwrapped.reward_params = reward_params
+        env = gym.make(env_id)
+        raw_env = env.unwrapped # type: FetchEnv
+        raw_env.reward_params = reward_params
         env.seed(seed)
         env = FlattenDictWrapper(env, dict_keys=['observation', 'desired_goal'])
+        env = Monitor(env, None)
         return env
     return _init
 
 
-def train(reward_params, sac_params, steps, model_path, seed=42, tb_log_name='SAC',
-          normalize_obs=False, vec_normalize_dir=None):
+def unnormalize_obs(obs: np.ndarray, env: VecNormalize):
+    return obs * np.sqrt(env.obs_rms.var + env.epsilon) + env.obs_rms.mean
 
-    tb_dir = f'{OUT_DIR}/tensorboard/'
-    os.makedirs(tb_dir, exist_ok=True)
 
-    env = DummyVecEnv([init_env(seed=seed, reward_params=reward_params)])
+def train(*, env_id, reward_params, sac_params, steps, local_dir, seed=42, checkpoint_freq=10_000, log_freq=1_000):
 
-    if normalize_obs:
-        assert vec_normalize_dir is not None
-        os.makedirs(vec_normalize_dir, exist_ok=True)
-        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
-        raw_env = env.venv.envs[0].unwrapped  # type: FetchPickAndPlaceEnv
-    else:
-        raw_env = env.unwrapped  # type: FetchPickAndPlaceEnv
+    now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    local_dir = f'{local_dir}/{now}'
+    checkpoints_dir = f'{local_dir}/checkpoints'
+    normalizer_dir = f'{local_dir}/normalizer'
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(normalizer_dir, exist_ok=True)
 
-    assert isinstance(raw_env, FetchPickAndPlaceEnv)
+    tb_writer = SummaryWriter(log_dir=local_dir)
+    env = DummyVecEnv([init_env(env_id=env_id, seed=seed, reward_params=reward_params)])
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=200.)
+    model = SAC(MlpPolicy, env, verbose=0, tensorboard_log=None, **sac_params)
 
-    global original_cumulative_rew
-    original_cumulative_rew = 0.0
+    global tb_info
+    tb_info = None
+
+    def reset_tb_info():
+        global tb_info
+        tb_info = dict(
+            successes=[],
+            orig_rewards=[]
+        )
+
+    def save_checkpoint(epoch):
+        print('Saved checkpoint for epoch', epoch)
+        model_path = f'{checkpoints_dir}/model_{epoch}.pkl'
+        model.save(model_path)
+        env.save_running_average(normalizer_dir)
 
     def callback(model_locals, model_globals):
-        global original_cumulative_rew
+        global tb_info
 
-        step = model_locals.get('step') # type: int
-        writer = model_locals.get('writer') # type: tf.summary.FileWriter
+        step = model_locals['step'] # type: int
         done = model_locals.get('done', False)
-
-        if normalize_obs:
-            obs = env.old_obs[0].copy()
-        else:
-            obs = model_locals.get('obs')
-
-        achieved_goal = obs[3:6]
-        original_rew = -fetch_env_goal_distance(achieved_goal, raw_env.goal)
-        original_cumulative_rew += original_rew
-
         if done:
-            s = tf.Summary()
-            s.value.add(tag='original_episode_reward', simple_value=original_cumulative_rew)
-            writer.add_summary(s, step)
-            original_cumulative_rew = 0.0
+            if tb_info is None:
+                reset_tb_info()
+            info = model_locals['info']
+            success = info['is_success']
+            obs = model_locals['new_obs']
+            obs = unnormalize_obs(obs, env)
+            achieved_goal, goal = obs[..., 3:6], obs[..., -3:]
+            original_reward = -fetch_env_goal_distance(achieved_goal, goal)
+            tb_info['successes'].append(success)
+            tb_info['orig_rewards'].append(original_reward)
 
-    model = SAC(MlpPolicy, env, verbose=1, tensorboard_log=tb_dir, **sac_params)
-    model.learn(total_timesteps=steps, tb_log_name=tb_log_name, callback=callback)
-    model.save(model_path)
+        if step > 0 and step % log_freq == 0:
+            start_time = model_locals['start_time']
+            tb_scalars = dict(
+                episodes=model_locals['num_episodes'],
+                network_updates=model_locals['n_updates'],
+                learning_rate=model_locals['current_lr'],
+                mean_reward=model_locals['mean_reward'],
+                time_elapsed=int(time.time() - start_time),
+                fps=(step / int(time.time() - start_time)),
+                avg_original_success_rate=np.mean(tb_info['successes']),
+                avg_original_rew=np.mean(tb_info['orig_rewards']),
+            )
+            print('\n' + '#' * 40)
+            print(f'Step {step}')
+            print('#' * 40)
+            for k, v in tb_scalars.items():
+                print(f'{k}: {v}')
+                tb_writer.add_scalar(f'data/{k}', v, step)
+            tb_info = None
 
-    if normalize_obs:
-        env.save_running_average(vec_normalize_dir)
+        if step > 0 and step % checkpoint_freq == 0:
+            epoch = step // checkpoint_freq
+            save_checkpoint(epoch)
 
-
-def train_configs(config_index=None, play_only=False):
-
-    configs = [
-        dict(
-            name='alpha1.0a_k2_c0.5_md0.03',
-            reward_params=dict(k=2.0, c=0.5, min_dist=0.03),
-            sac_params=dict(ent_coef='auto_1.0')
-        ),
-        dict(
-            name='alpha0.1a_k2_c1_md0.03',
-            reward_params=dict(k=2.0, c=1.0, min_dist=0.03),
-            sac_params=dict(ent_coef='auto_0.1')
-        ),
-        dict(
-            name='alpha1.0a_k1.5_c0.5_md0.03',
-            reward_params=dict(k=1.5, c=0.5, min_dist=0.03),
-            sac_params=dict(ent_coef='auto_1.0')
-        ),
-        dict(
-            name='alpha0.1a_k1.5_c1_md0.03',
-            reward_params=dict(k=1.5, c=1.0, min_dist=0.03),
-            sac_params=dict(ent_coef='auto_0.1')
-        ),
-        dict(
-            name='alpha0.1a_k1_c0.1_md0.03',
-            reward_params=dict(k=1.0, c=0.1, min_dist=0.03),
-            sac_params=dict(ent_coef='auto_0.1')
-        ),
-    ]
-
-    if config_index is not None:
-        configs = [configs[config_index]]
-
-    for conf in configs:
-        steps = 5_000_000
-        model_path = f'{OUT_DIR}/fetch_sac_model_{conf["name"]}_s5M.pkl'
-        tb_name = f'SAC_{conf["name"]}'
-        seed = 42
-        if play_only:
-            play(model_path, conf['reward_params'])
-        else:
-            train(conf['reward_params'], conf['sac_params'], steps, model_path, seed, tb_log_name=tb_name)
+    model.learn(total_timesteps=steps, callback=callback, tb_log_name='tb')
 
 
-def play(model_path, reward_params=None):
-    env = DummyVecEnv([init_env(seed=42, reward_params=reward_params)])
-    model = SAC.load(model_path)
+def play(*, env_id, run_dir, reward_params=None, epoch):
+
+    model_path = f'{run_dir}/checkpoints/model_{epoch}.pkl'
+    normalizer_dir = f'{run_dir}/normalizer'
+
+    env = DummyVecEnv([init_env(env_id=env_id, seed=42, reward_params=reward_params)])
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=200., training=False)
+    env.load_running_average(normalizer_dir)
+
+    model = SAC.load(model_path, env=env)
+    obs = env.reset()
     while True:
-        obs = env.reset()
-        for _ in range(100):
-            env.render()
-            u = model.predict(obs, deterministic=True)[0]
-            obs, rew, done, info = env.step(u)
-            print(rew)
-
-
-def main():
-
-    reward_params = dict(k=2.0, c=0.5, min_dist=0.03)
-    model_path = f'{OUT_DIR}/model_sac_mlp_fetch_500k.pkl'
-
-    if TRAIN:
-        train(reward_params, dict(), 500_000, model_path)
-    else:
-        play(model_path, reward_params)
+        env.render()
+        u = model.predict(obs, deterministic=True)[0]
+        obs, rew, done, info = env.step(u)
+        print(rew)
 
 
 if __name__ == '__main__':
-    # main()
 
-    # should be able to do 1M steps with 4 workers in approx 2h
-    train_configs(4)
+    train(
+        env_id='FetchPickAndPlaceDense-v1',
+        reward_params=dict(stepped=True),
+        local_dir=f'{OUT_DIR}/fetch_stepped_rew_v2',
+        steps=100_000_000,
+        log_freq=1_000, # in steps
+        checkpoint_freq=10_000, # in steps
+        sac_params=dict(
+            buffer_size=int(1e6),
+            batch_size=256,
+            tau=1e-2,
+            learning_rate=1e-3,
+        )
+    )
