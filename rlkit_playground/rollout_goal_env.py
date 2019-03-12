@@ -33,6 +33,7 @@ def simulate_policy(file_path, gpu=False, max_path_length=50):
             animated=True,
             observation_key='observation',
             desired_goal_key='desired_goal',
+            get_action_kwargs=dict(deterministic=True)
         ))
         if hasattr(env, "log_diagnostics"):
             env.log_diagnostics(paths)

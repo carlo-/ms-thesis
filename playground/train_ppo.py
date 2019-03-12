@@ -11,11 +11,12 @@ from stable_baselines import PPO2
 
 import gym
 from gym.wrappers import FlattenDictWrapper
-from gym.envs.robotics import FetchPickAndPlaceEnv
-from gym.envs.robotics.fetch_env import goal_distance as fetch_env_goal_distance
+from gym.envs.robotics.fetch_env import FetchEnv, goal_distance as fetch_env_goal_distance
 
 
-OUT_DIR = '../out/ppo2'
+ALG_NAME = 'ppo2'
+OUT_DIR = f'../out/{ALG_NAME}'
+REMOTE_OUT_DIR = f'/run/user/1000/gvfs/sftp:host=mordor.csc.kth.se,port=2222,user=carlora/home/carlora/thesis/repo/out/{ALG_NAME}'
 os.makedirs(OUT_DIR, exist_ok=True)
 current_epoch = None
 
@@ -23,13 +24,17 @@ current_epoch = None
 def init_env(*, env_id, seed=0, reward_params=None):
     def _init():
         env = gym.make(env_id)
-        raw_env = env.unwrapped # type: FetchPickAndPlaceEnv
+        raw_env = env.unwrapped # type: FetchEnv
         raw_env.reward_params = reward_params
         env.seed(seed)
         env = FlattenDictWrapper(env, dict_keys=['observation', 'desired_goal'])
         env = Monitor(env, None)
         return env
     return _init
+
+
+def unnormalize_obs(obs: np.ndarray, env: VecNormalize):
+    return obs * np.sqrt(env.obs_rms.var + env.epsilon) + env.obs_rms.mean
 
 
 def train(*, env_id, reward_params, ppo_params, steps, local_dir, seed=42, n_cpus=1, checkpoint_freq=1):
@@ -69,14 +74,15 @@ def train(*, env_id, reward_params, ppo_params, steps, local_dir, seed=42, n_cpu
 
             obs = model_locals.get('obs')
             if obs is not None and len(obs) > 0:
-
+                obs = unnormalize_obs(obs, env)
                 achieved_goals, goals = obs[..., 3:6], obs[..., -3:]
                 original_rewards = -fetch_env_goal_distance(achieved_goals, goals)
+                avg_original_success_rate = np.mean(-original_rewards < 0.05)
                 avg_original_rew = np.mean(original_rewards)
 
-                print(avg_original_rew)
                 s = tf.Summary()
-                s.value.add(tag='original_episode_reward', simple_value=avg_original_rew)
+                s.value.add(tag='custom/original_episode_reward', simple_value=avg_original_rew)
+                s.value.add(tag='custom/original_success_rate', simple_value=avg_original_success_rate)
                 writer.add_summary(s, step)
 
     model.learn(total_timesteps=steps, callback=callback, tb_log_name='tb')
@@ -115,6 +121,6 @@ if __name__ == '__main__':
     # play(
     #     env_id='FetchPickAndPlaceDense-v1',
     #     reward_params=dict(stepped=True),
-    #     run_dir=f'{OUT_DIR}/fetch_stepped_rew/mordor',
-    #     epoch=3900,
+    #     run_dir=f'{REMOTE_OUT_DIR}/fetch_stepped_rew_v2/2019-03-12_11-54-00',
+    #     epoch=6800,
     # )
