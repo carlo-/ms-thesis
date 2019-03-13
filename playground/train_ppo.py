@@ -11,7 +11,7 @@ from stable_baselines import PPO2
 
 import gym
 from gym.wrappers import FlattenDictWrapper
-from gym.envs.robotics.fetch_env import FetchEnv, goal_distance as fetch_env_goal_distance
+from gym.envs.robotics.fetch_env import goal_distance as fetch_env_goal_distance
 
 
 ALG_NAME = 'ppo2'
@@ -21,13 +21,13 @@ os.makedirs(OUT_DIR, exist_ok=True)
 current_epoch = None
 
 
-def init_env(*, env_id, seed=0, reward_params=None):
+def init_env(*, env_id, seed=0, env_kwargs=None):
     def _init():
-        env = gym.make(env_id)
-        raw_env = env.unwrapped # type: FetchEnv
-        raw_env.reward_params = reward_params
+        kwargs = env_kwargs or dict()
+        env = gym.make(env_id, **kwargs)
         env.seed(seed)
-        env = FlattenDictWrapper(env, dict_keys=['observation', 'desired_goal'])
+        if isinstance(env.unwrapped, gym.GoalEnv):
+            env = FlattenDictWrapper(env, dict_keys=['observation', 'desired_goal'])
         env = Monitor(env, None)
         return env
     return _init
@@ -37,7 +37,7 @@ def unnormalize_obs(obs: np.ndarray, env: VecNormalize):
     return obs * np.sqrt(env.obs_rms.var + env.epsilon) + env.obs_rms.mean
 
 
-def train(*, env_id, reward_params, ppo_params, steps, local_dir, seed=42, n_cpus=1, checkpoint_freq=1):
+def train(*, env_id, env_kwargs, ppo_params, steps, local_dir, seed=42, n_cpus=1, checkpoint_freq=1):
 
     now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     local_dir = f'{local_dir}/{now}'
@@ -46,7 +46,7 @@ def train(*, env_id, reward_params, ppo_params, steps, local_dir, seed=42, n_cpu
     os.makedirs(checkpoints_dir, exist_ok=True)
     os.makedirs(normalizer_dir, exist_ok=True)
 
-    env = SubprocVecEnv([init_env(env_id=env_id, seed=seed+i, reward_params=reward_params) for i in range(n_cpus)])
+    env = SubprocVecEnv([init_env(env_id=env_id, seed=seed+i, env_kwargs=env_kwargs) for i in range(n_cpus)])
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=200.)
     model = PPO2(MlpPolicy, env, verbose=1, tensorboard_log=local_dir, **ppo_params)
 
@@ -88,12 +88,12 @@ def train(*, env_id, reward_params, ppo_params, steps, local_dir, seed=42, n_cpu
     model.learn(total_timesteps=steps, callback=callback, tb_log_name='tb')
 
 
-def play(*, env_id, run_dir, reward_params=None, epoch):
+def play(*, env_id, run_dir, env_kwargs=None, epoch):
 
     model_path = f'{run_dir}/checkpoints/model_{epoch}.pkl'
     normalizer_dir = f'{run_dir}/normalizer'
 
-    env = DummyVecEnv([init_env(env_id=env_id, seed=42, reward_params=reward_params)])
+    env = DummyVecEnv([init_env(env_id=env_id, seed=42, env_kwargs=env_kwargs)])
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=200., training=False)
     env.load_running_average(normalizer_dir)
 
@@ -110,10 +110,15 @@ if __name__ == '__main__':
 
     train(
         env_id='FetchPickAndPlaceDense-v1',
-        reward_params=dict(stepped=True),
-        ppo_params=dict(),
+        env_kwargs=dict(
+            reward_params=dict(stepped=True),
+            explicit_goal_distance=True
+        ),
+        ppo_params=dict(
+            n_steps=256
+        ),
         steps=100_000_000,
-        local_dir=f'{OUT_DIR}/fetch_stepped_rew_v2',
+        local_dir=f'{OUT_DIR}/fetch_stepped_rew_v3',
         n_cpus=20,
         checkpoint_freq=40,
     )
@@ -122,5 +127,5 @@ if __name__ == '__main__':
     #     env_id='FetchPickAndPlaceDense-v1',
     #     reward_params=dict(stepped=True),
     #     run_dir=f'{REMOTE_OUT_DIR}/fetch_stepped_rew_v2/2019-03-12_11-54-00',
-    #     epoch=6800,
+    #     epoch=28120,
     # )
