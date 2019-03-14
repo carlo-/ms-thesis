@@ -46,6 +46,7 @@ def train(*, env_id, env_kwargs, ppo_params, steps, local_dir, seed=42, n_cpus=1
     os.makedirs(checkpoints_dir, exist_ok=True)
     os.makedirs(normalizer_dir, exist_ok=True)
 
+    is_fetch = 'Fetch' in env_id
     env = SubprocVecEnv([init_env(env_id=env_id, seed=seed+i, env_kwargs=env_kwargs) for i in range(n_cpus)])
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=200.)
     model = PPO2(MlpPolicy, env, verbose=1, tensorboard_log=local_dir, **ppo_params)
@@ -73,7 +74,7 @@ def train(*, env_id, env_kwargs, ppo_params, steps, local_dir, seed=42, n_cpus=1
                 save_checkpoint(current_epoch)
 
             obs = model_locals.get('obs')
-            if obs is not None and len(obs) > 0:
+            if is_fetch and obs is not None and len(obs) > 0:
                 obs = unnormalize_obs(obs, env)
                 achieved_goals, goals = obs[..., 3:6], obs[..., -3:]
                 original_rewards = -fetch_env_goal_distance(achieved_goals, goals)
@@ -109,18 +110,15 @@ def play(*, env_id, run_dir, env_kwargs=None, epoch):
 if __name__ == '__main__':
 
     train(
-        env_id='FetchPickAndPlaceDense-v1',
-        env_kwargs=dict(
-            reward_params=dict(stepped=True),
-            explicit_goal_distance=True
-        ),
+        env_id='YumiReachLeftArm-v0',
+        env_kwargs=dict(reward_type='dense'),
         ppo_params=dict(
             n_steps=256
         ),
         steps=100_000_000,
-        local_dir=f'{OUT_DIR}/fetch_stepped_rew_v3',
-        n_cpus=20,
-        checkpoint_freq=40,
+        local_dir=f'{OUT_DIR}/yumi_reach_test2',
+        n_cpus=10,
+        checkpoint_freq=20,
     )
 
     # play(
