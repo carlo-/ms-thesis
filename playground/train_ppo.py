@@ -1,4 +1,5 @@
 import os
+import glob
 from datetime import datetime
 
 import numpy as np
@@ -116,14 +117,21 @@ if __name__ == '__main__':
             n_steps=256
         ),
         steps=100_000_000,
-        local_dir=f'{OUT_DIR}/yumi_reach_test2',
-        n_cpus=10,
+        local_dir=f'{OUT_DIR}/yumi_reach_test3',
+        n_cpus=15,
         checkpoint_freq=20,
     )
 
     # play(
     #     env_id='FetchPickAndPlaceDense-v1',
-    #     reward_params=dict(stepped=True),
-    #     run_dir=f'{REMOTE_OUT_DIR}/fetch_stepped_rew_v2/2019-03-12_11-54-00',
-    #     epoch=28120,
+    #     env_kwargs=dict(reward_params=dict(stepped=True), explicit_goal_distance=True),
+    #     run_dir=glob.glob(f'{REMOTE_OUT_DIR}/fetch_stepped_rew_v3/*')[0],
+    #     epoch=19520,
+    # )
+
+    # play(
+    #     env_id='YumiReachLeftArm-v0',
+    #     env_kwargs=dict(reward_type='dense'),
+    #     run_dir=glob.glob(f'{REMOTE_OUT_DIR}/yumi_reach_test2/*')[0],
+    #     epoch=1880,
     # )
