@@ -90,15 +90,23 @@ def train(*, env_id, env_kwargs, ppo_params, steps, local_dir, seed=42, n_cpus=1
     model.learn(total_timesteps=steps, callback=callback, tb_log_name='tb')
 
 
-def play(*, env_id, run_dir, env_kwargs=None, epoch):
+def play(*, env_id, run_dir, env_kwargs=None, epoch=None):
 
-    model_path = f'{run_dir}/checkpoints/model_{epoch}.pkl'
+    epoch = epoch or '*'
+    model_path = '{run_dir}/checkpoints/model_{epoch}.pkl'
     normalizer_dir = f'{run_dir}/normalizer'
+
+    if epoch == '*':
+        paths = glob.glob(model_path.format(run_dir=run_dir, epoch='*'))
+        if len(paths) == 0:
+            raise FileNotFoundError
+        epoch = np.max([int(p.split('model_')[1].split('.pkl')[0]) for p in paths])
 
     env = DummyVecEnv([init_env(env_id=env_id, seed=42, env_kwargs=env_kwargs)])
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=200., training=False)
     env.load_running_average(normalizer_dir)
 
+    model_path = model_path.format(run_dir=run_dir, epoch=epoch)
     model = PPO2.load(model_path, env=env)
     obs = env.reset()
     while True:
@@ -111,13 +119,13 @@ def play(*, env_id, run_dir, env_kwargs=None, epoch):
 if __name__ == '__main__':
 
     train(
-        env_id='YumiReachLeftArm-v0',
+        env_id='YumiReachTwoArms-v0',
         env_kwargs=dict(reward_type='dense'),
         ppo_params=dict(
             n_steps=256
         ),
         steps=100_000_000,
-        local_dir=f'{OUT_DIR}/yumi_reach_test3',
+        local_dir=f'{OUT_DIR}/yumi_reach_test4',
         n_cpus=15,
         checkpoint_freq=20,
     )
@@ -132,6 +140,6 @@ if __name__ == '__main__':
     # play(
     #     env_id='YumiReachLeftArm-v0',
     #     env_kwargs=dict(reward_type='dense'),
-    #     run_dir=glob.glob(f'{REMOTE_OUT_DIR}/yumi_reach_test2/*')[0],
-    #     epoch=1880,
+    #     run_dir=glob.glob(f'{REMOTE_OUT_DIR}/yumi_reach_test3/*')[0],
+    #     epoch=None,
     # )
