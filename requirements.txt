@@ -3,8 +3,9 @@ scikit-learn
 pandas
 joblib
 tqdm
-git+https://github.com/carlo-/gym@e933ffac36624c142f53dd48f8126b6399cad0fa#egg=gym
+git+https://github.com/carlo-/gym@3030e319efe3e6668c1e206c9977e2609ebf5d30#egg=gym
 cffi
+cvxopt
 mujoco_py
 matplotlib
 numpy

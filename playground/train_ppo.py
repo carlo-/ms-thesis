@@ -22,13 +22,14 @@ os.makedirs(OUT_DIR, exist_ok=True)
 current_epoch = None
 
 
-def init_env(*, env_id, seed=0, env_kwargs=None):
+def init_env(*, env_id, seed=0, env_kwargs=None, obs_keys=None):
     def _init():
         kwargs = env_kwargs or dict()
         env = gym.make(env_id, **kwargs)
         env.seed(seed)
         if isinstance(env.unwrapped, gym.GoalEnv):
-            env = FlattenDictWrapper(env, dict_keys=['observation', 'desired_goal'])
+            dict_keys = obs_keys or ['observation', 'desired_goal']
+            env = FlattenDictWrapper(env, dict_keys=dict_keys)
         env = Monitor(env, None)
         return env
     return _init
@@ -38,7 +39,7 @@ def unnormalize_obs(obs: np.ndarray, env: VecNormalize):
     return obs * np.sqrt(env.obs_rms.var + env.epsilon) + env.obs_rms.mean
 
 
-def train(*, env_id, env_kwargs, ppo_params, steps, local_dir, seed=42, n_cpus=1, checkpoint_freq=1):
+def train(*, env_id, env_kwargs, ppo_params, steps, local_dir, seed=42, n_cpus=1, checkpoint_freq=1, obs_keys=None):
 
     now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     local_dir = f'{local_dir}/{now}'
@@ -48,7 +49,7 @@ def train(*, env_id, env_kwargs, ppo_params, steps, local_dir, seed=42, n_cpus=1
     os.makedirs(normalizer_dir, exist_ok=True)
 
     is_fetch = 'Fetch' in env_id
-    env = SubprocVecEnv([init_env(env_id=env_id, seed=seed+i, env_kwargs=env_kwargs) for i in range(n_cpus)])
+    env = SubprocVecEnv([init_env(env_id=env_id, seed=seed+i, env_kwargs=env_kwargs, obs_keys=obs_keys) for i in range(n_cpus)])
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=200.)
     model = PPO2(MlpPolicy, env, verbose=1, tensorboard_log=local_dir, **ppo_params)
 
@@ -90,7 +91,7 @@ def train(*, env_id, env_kwargs, ppo_params, steps, local_dir, seed=42, n_cpus=1
     model.learn(total_timesteps=steps, callback=callback, tb_log_name='tb')
 
 
-def play(*, env_id, run_dir, env_kwargs=None, epoch=None):
+def play(*, env_id, run_dir, env_kwargs=None, epoch=None, obs_keys=None):
 
     epoch = epoch or '*'
     model_path = '{run_dir}/checkpoints/model_{epoch}.pkl'
@@ -102,7 +103,7 @@ def play(*, env_id, run_dir, env_kwargs=None, epoch=None):
             raise FileNotFoundError
         epoch = np.max([int(p.split('model_')[1].split('.pkl')[0]) for p in paths])
 
-    env = DummyVecEnv([init_env(env_id=env_id, seed=42, env_kwargs=env_kwargs)])
+    env = DummyVecEnv([init_env(env_id=env_id, seed=42, env_kwargs=env_kwargs, obs_keys=obs_keys)])
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=200., training=False)
     env.load_running_average(normalizer_dir)
 
@@ -118,17 +119,17 @@ def play(*, env_id, run_dir, env_kwargs=None, epoch=None):
 
 if __name__ == '__main__':
 
-    train(
-        env_id='YumiReachTwoArms-v0',
-        env_kwargs=dict(reward_type='dense'),
-        ppo_params=dict(
-            n_steps=256
-        ),
-        steps=100_000_000,
-        local_dir=f'{OUT_DIR}/yumi_reach_test4',
-        n_cpus=15,
-        checkpoint_freq=20,
-    )
+    # train(
+    #     env_id='YumiReachTwoArms-v0',
+    #     env_kwargs=dict(reward_type='dense'),
+    #     ppo_params=dict(
+    #         n_steps=256
+    #     ),
+    #     steps=100_000_000,
+    #     local_dir=f'{OUT_DIR}/yumi_reach_test4',
+    #     n_cpus=15,
+    #     checkpoint_freq=20,
+    # )
 
     # play(
     #     env_id='FetchPickAndPlaceDense-v1',
@@ -142,4 +143,30 @@ if __name__ == '__main__':
     #     env_kwargs=dict(reward_type='dense'),
     #     run_dir=glob.glob(f'{REMOTE_OUT_DIR}/yumi_reach_test3/*')[0],
     #     epoch=None,
+    # )
+
+    # play(
+    #     env_id='YumiReachTwoArms-v0',
+    #     env_kwargs=dict(reward_type='dense'),
+    #     run_dir=glob.glob(f'{REMOTE_OUT_DIR}/yumi_reach_test4/*')[0],
+    #     epoch=None,
+    # )
+
+    train(
+        env_id='HandStepped-v0',
+        env_kwargs=dict(),
+        ppo_params=dict(),
+        steps=5_000_000,
+        local_dir=f'{OUT_DIR}/hand_stepped_test1',
+        n_cpus=8,
+        checkpoint_freq=10,
+        obs_keys=['observation']
+    )
+
+    # play(
+    #     env_id='HandStepped-v0',
+    #     env_kwargs=dict(render_substeps=True),
+    #     run_dir=glob.glob(f'{OUT_DIR}/hand_stepped_test1/*')[0],
+    #     epoch=None,
+    #     obs_keys=['observation']
     # )
