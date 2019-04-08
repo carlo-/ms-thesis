@@ -1,18 +1,18 @@
 tensorboardX
-scikit-learn
+scikit-learn==0.20.3
 pandas
 joblib
 tqdm
 git+https://github.com/carlo-/gym@3030e319efe3e6668c1e206c9977e2609ebf5d30#egg=gym
 cffi
-cvxopt
+cvxopt==1.2.3
 mujoco_py==1.50.1.68
-matplotlib
+matplotlib==3.0.3
 numpy
-scipy
+scipy==1.2.1
 stable-baselines
-mpi4py
-ray[rllib]
+mpi4py==3.0.1
+ray[rllib]==0.6.4
 ray[debug]
-pybullet
+pybullet==2.4.8
 -e git+https://github.com/benelot/pybullet-gym.git#egg=pybulletgym
