@@ -6,7 +6,7 @@ tqdm
 git+https://github.com/carlo-/gym@3030e319efe3e6668c1e206c9977e2609ebf5d30#egg=gym
 cffi
 cvxopt
-mujoco_py
+mujoco_py==1.50.1.68
 matplotlib
 numpy
 scipy
