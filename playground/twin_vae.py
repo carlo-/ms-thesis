@@ -2,13 +2,15 @@ import pickle
 from typing import Callable
 from copy import deepcopy
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torch import nn, optim
 from torch.nn import functional as F
 from sklearn.model_selection import train_test_split
+from tqdm import tqdm
 
-from .dtw import dynamic_time_warping
+from dtw import dynamic_time_warping
 
 
 class VAE(nn.Module):
@@ -64,6 +66,11 @@ class TwinVAE:
         self.a_loss = self.a_vae.build_loss_function()
         self.b_loss = self.b_vae.build_loss_function()
         self.sim_loss = nn.MSELoss()
+        self._device = torch.device('cpu')
+
+    @property
+    def device(self):
+        return self._device
 
     def compute_losses(self, a_data, b_data):
 
@@ -81,6 +88,7 @@ class TwinVAE:
     def to(self, device):
         self.a_vae = self.a_vae.to(device)
         self.b_vae = self.b_vae.to(device)
+        self._device = device
 
     def train(self):
         self.a_vae.train()
@@ -94,7 +102,7 @@ class TwinVAE:
         return list(self.a_vae.parameters()) + list(self.b_vae.parameters())
 
 
-def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, epoch: int):
+def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, device, epoch: int, log_interval=1):
     model.train()
     train_loss = 0
 
@@ -112,16 +120,16 @@ def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, epoc
         train_loss += total_loss.item()
         optimizer.step()
 
-        if batch_idx % args.log_interval == 0:
+        if batch_idx % log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(a_data), len(data_loader.dataset),
                 100. * batch_idx / len(data_loader), total_loss.item() / len(a_data))
             )
 
-    print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, train_loss / len(train_loader.dataset)))
+    print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, train_loss / len(data_loader.dataset)))
 
 
-def _evaluation_step(model: TwinVAE, data_loader):
+def _evaluation_step(model: TwinVAE, data_loader, device):
     model.eval()
     test_loss = 0
     with torch.no_grad():
@@ -139,7 +147,7 @@ def _evaluation_step(model: TwinVAE, data_loader):
 
 class TwinDataset(Dataset):
 
-    def __init__(self, a_episodes: list, b_episodes: list, a_states=None, b_states=None, copy=False):
+    def __init__(self, a_episodes: list, b_episodes: list, a_states=None, b_states=None, copy=True):
         super(TwinDataset, self).__init__()
         assert len(a_episodes) == len(b_episodes)
         assert len(a_episodes) > 0
@@ -162,7 +170,7 @@ class TwinDataset(Dataset):
             self.b_episodes = b_episodes
 
     def __getitem__(self, idx):
-        return self.a_states[idx], self.b_states[idx]
+        return self.a_states[idx].astype(np.float32), self.b_states[idx].astype(np.float32)
 
     def __len__(self):
         return len(self.a_states)
@@ -189,20 +197,24 @@ class TwinDataset(Dataset):
         return TwinDataset(**obj, copy=False)
 
     def assume_temporal_alignment(self):
-        self.realign(lambda _: 0.0)
+        self.realign(lambda x, y: 0.0)
 
     def realign(self, distance_fn: Callable):
         self.a_states = []
         self.b_states = []
-        for i, (a_ep, b_ep) in enumerate(zip(self.a_episodes, self.b_episodes)):
+        for a_ep, b_ep in tqdm(zip(self.a_episodes, self.b_episodes),
+                               desc='Aligned episodes', total=len(self.a_episodes)):
             cost, path = dynamic_time_warping(a_ep, b_ep, distance_fn)
             self.a_states += list(a_ep[path[:, 0]])
             self.b_states += list(b_ep[path[:, 1]])
 
     def realign_with_model(self, model: TwinVAE):
         model.eval()
+        dev = model.device
 
         def distance_fn(a, b):
+            a = torch.tensor(a[np.newaxis], requires_grad=False, dtype=torch.float32, device=dev)
+            b = torch.tensor(b[np.newaxis], requires_grad=False, dtype=torch.float32, device=dev)
             sim_loss = model.compute_losses(a, b)[-1]
             return sim_loss.item()
 
@@ -218,14 +230,15 @@ class TwinDataset(Dataset):
         return self.b_episodes[0].shape[1]
 
 
-def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42, n_workers=1, n_epochs=100, batch_size=16):
+def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42,
+          n_workers=1, n_epochs=100, batch_size=32):
 
     torch.manual_seed(seed)
 
     model = TwinVAE(
-        a_spec=dict(input_size=training_set.a_item_size, hidden_size=64),
-        b_spec=dict(input_size=training_set.b_item_size, hidden_size=64),
-        z_size=16
+        a_spec=dict(input_size=training_set.a_item_size, hidden_size=32),
+        b_spec=dict(input_size=training_set.b_item_size, hidden_size=16),
+        z_size=4
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -243,25 +256,128 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
     for epoch in range(n_epochs):
 
         print('Training...')
-        _training_step(model, optimizer, training_data_loader, epoch)
+        _training_step(model, optimizer, training_data_loader, device, epoch)
 
         print('Realigning test dataset...')
         test_set.realign_with_model(model)
 
         print('Evaluating...')
-        _evaluation_step(model, test_data_loader)
+        _evaluation_step(model, test_data_loader, device)
 
         print('Realigning training dataset...')
         training_set.realign_with_model(model)
 
 
-if __name__ == '__main__':
+def _generate_twin_episodes(n=1_000, max_ep_steps=200, seed=42, render=False):
 
-    _full_dataset = TwinDataset.load("")
+    import gym
+    from gym.envs.robotics import FetchPickAndPlaceEnv
+    from gym.envs.robotics import HandPickAndPlaceEnv
+    from gym.agents.fetch import FetchPickAndPlaceAgent
+    from gym.agents.shadow_hand import HandPickAndPlaceAgent
+
+    def flatten_obs(obs_dict):
+        return np.r_[obs_dict['observation'], obs_dict['desired_goal']]
+
+    a_env = gym.make(
+        'FetchPickAndPlace-v1'
+    ).unwrapped # type: FetchPickAndPlaceEnv
+
+    b_env = gym.make(
+        'HandPickAndPlace-v0',
+        ignore_rotation_ctrl=True,
+        ignore_target_rotation=True,
+        success_on_grasp_only=False,
+        randomize_initial_arm_pos=True,
+        randomize_initial_object_pos=True,
+        object_id='small_box'
+    ).unwrapped # type: HandPickAndPlaceEnv
+
+    a_env.seed(seed)
+    b_env.seed(seed)
+
+    a_agent = FetchPickAndPlaceAgent(a_env)
+    b_agent = HandPickAndPlaceAgent(b_env)
+
+    a_episodes = []
+    b_episodes = []
+    prog = tqdm(total=n, desc='Recorded episodes')
+
+    while len(a_episodes) < n:
+
+        a_states = []
+        b_states = []
+
+        a_env.reset()
+        b_env.reset()
+
+        if a_env.goal[2] < 0.48:
+            # desired goal is too close to the table
+            continue
+
+        b_env.goal = np.r_[a_env.goal, np.zeros(4)]
+
+        object_pos = b_env.sim.data.get_joint_qpos('object:joint').copy()
+        object_pos[:2] = a_env.sim.data.get_joint_qpos('object0:joint')[:2].copy()
+        b_env.sim.data.set_joint_qpos('object:joint', object_pos)
+        b_env.sim.forward()
+
+        a_agent.reset()
+        b_agent.reset()
+
+        a_obs = a_env._get_obs()
+        b_obs = b_env._get_obs()
+
+        a_states.append(flatten_obs(a_obs))
+        b_states.append(flatten_obs(b_obs))
+
+        success = False
+
+        for _ in range(max_ep_steps):
+
+            a_action = a_agent.predict(a_obs)
+            b_action = b_agent.predict(b_obs)
+
+            a_obs, a_rew, a_done, a_info = a_env.step(a_action)
+            b_obs, b_rew, b_done, b_info = b_env.step(b_action)
+
+            a_states.append(flatten_obs(a_obs))
+            b_states.append(flatten_obs(b_obs))
+
+            if render:
+                a_env.render()
+                b_env.render()
+
+            success = a_info['is_success'] == 1.0 and b_info['is_success'] == 1.0
+            if success:
+                break
+
+            if a_done or b_done:
+                break
+
+        if success:
+            prog.update()
+            a_episodes.append(np.array(a_states))
+            b_episodes.append(np.array(b_states))
+
+    prog.close()
+    return a_episodes, b_episodes
+
+
+def _generate_twin_dataset(file_path, n=1_000, max_ep_steps=200, seed=42, render=False):
+    a_episodes, b_episodes = _generate_twin_episodes(n=n, max_ep_steps=max_ep_steps, seed=seed, render=render)
+    dataset = TwinDataset(a_episodes=a_episodes, b_episodes=b_episodes, copy=False)
+    dataset.save(file_path, with_aligned_states=False)
+
+
+if __name__ == '__main__':
+    # _generate_twin_dataset(file_path='../out/pp_twin_dataset.pkl', n=100, render=False)
+
+    _full_dataset = TwinDataset.load('../out/pp_twin_dataset.pkl')
     _training_set, _test_set = _full_dataset.split(shuffle=True, test_size=0.25, seed=42)
 
     train(
         training_set=_training_set,
         test_set=_test_set,
-        local_dir=""
+        local_dir='../out/pp_twin_test'
     )
