@@ -1,9 +1,10 @@
+torch
 tensorboardX
 scikit-learn==0.20.3
 pandas
 joblib
 tqdm
-git+https://github.com/carlo-/gym@3030e319efe3e6668c1e206c9977e2609ebf5d30#egg=gym
+git+https://github.com/carlo-/gym@5bbd910a877ab849a9b75f35777286380363e454#egg=gym
 cffi
 cvxopt==1.2.3
 mujoco_py==1.50.1.68
