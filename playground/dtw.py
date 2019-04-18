@@ -26,7 +26,7 @@ def compute_path(cost: np.ndarray) -> np.ndarray:
     return np.c_[p[::-1], q[::-1]]
 
 
-def dynamic_time_warping(s, t, distance_fn: Callable):
+def dynamic_time_warping(s, t, distance_fn: Callable = None, precomputed_distances: np.ndarray = None):
     """
     Vanilla implementation of Dynamic Time Warping.
     For info and original source: https://en.wikipedia.org/wiki/Dynamic_time_warping
@@ -34,6 +34,8 @@ def dynamic_time_warping(s, t, distance_fn: Callable):
     :param t: the second sequence to align, with shape (m x ...)
     :param distance_fn: a distance function that returns the distance between two elements
     of the sequences (according to any metric)
+    :param precomputed_distances: matrix of distances precomputed w/ distance_fn; note that this parameter
+     and distance_fn are mutually exclusive
     :return: a tuple with the cost as a (n x m) matrix and the best path
     """
 
@@ -48,7 +50,10 @@ def dynamic_time_warping(s, t, distance_fn: Callable):
 
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            dist = distance_fn(s[i-1], t[j-1])
+            if precomputed_distances is not None:
+                dist = precomputed_distances[i-1, j-1]
+            else:
+                dist = distance_fn(s[i-1], t[j-1])
             cost[i, j] = dist + min(cost[i-1, j],
                                     cost[i, j-1],
                                     cost[i-1, j-1])

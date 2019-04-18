@@ -66,11 +66,18 @@ class TwinVAE:
         self.a_loss = self.a_vae.build_loss_function()
         self.b_loss = self.b_vae.build_loss_function()
         self.sim_loss = nn.MSELoss()
+        self.sim_loss_no_red = nn.MSELoss(reduction='none')
         self._device = torch.device('cpu')
 
     @property
     def device(self):
         return self._device
+
+    def compute_elementwise_sim_loss(self, a_data, b_data):
+        # TODO: This could be optimized
+        a_z, a_recon_x, a_mu, a_logvar = self.a_vae(a_data)
+        b_z, b_recon_x, b_mu, b_logvar = self.b_vae(b_data)
+        return self.sim_loss_no_red(a_z, b_z)
 
     def compute_losses(self, a_data, b_data):
 
@@ -212,14 +219,25 @@ class TwinDataset(Dataset):
         model.eval()
         dev = model.device
 
-        def distance_fn(a, b):
-            a = torch.tensor(a[np.newaxis], requires_grad=False, dtype=torch.float32, device=dev)
-            b = torch.tensor(b[np.newaxis], requires_grad=False, dtype=torch.float32, device=dev)
-            sim_loss = model.compute_losses(a, b)[-1]
-            return sim_loss.item()
+        self.a_states = []
+        self.b_states = []
+        for a_ep, b_ep in tqdm(zip(self.a_episodes, self.b_episodes),
+                               desc='Aligned episodes', total=len(self.a_episodes)):
 
-        with torch.no_grad():
-            self.realign(distance_fn)
+            with torch.no_grad():
+                a = torch.tensor(a_ep, dtype=torch.float32, device=dev)
+                b = torch.tensor(b_ep, dtype=torch.float32, device=dev)
+                n, m = a.shape[0], b.shape[0]
+                res = torch.zeros((n, m), dtype=torch.float32, device=dev)
+                for i in range(n):
+                    sim_loss = model.compute_elementwise_sim_loss(a[i].repeat(m, 1), b)
+                    res[i] = sim_loss.mean(dim=1)
+                precomputed_distances = res.cpu().numpy()
+
+            cost, path = dynamic_time_warping(a_ep, b_ep, precomputed_distances=precomputed_distances)
+
+            self.a_states += list(a_ep[path[:, 0]])
+            self.b_states += list(b_ep[path[:, 1]])
 
     @property
     def a_item_size(self):
