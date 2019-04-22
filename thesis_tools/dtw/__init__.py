@@ -1,0 +1,2 @@
+from thesis_tools.dtw.dtw_c import dynamic_time_warping_c
+from thesis_tools.dtw.dtw_slow import dynamic_time_warping as dynamic_time_warping_py

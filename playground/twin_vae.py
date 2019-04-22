@@ -1,3 +1,4 @@
+import os
 import pickle
 from typing import Callable
 from copy import deepcopy
@@ -8,9 +9,10 @@ from torch.utils.data import DataLoader, Dataset
 from torch import nn, optim
 from torch.nn import functional as F
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-from dtw import dynamic_time_warping
+from thesis_tools.dtw import dynamic_time_warping_c, dynamic_time_warping_py
 
 
 def _fast_dtw_with_model(a_eps, b_eps, worker_i, queue, model):
@@ -31,11 +33,11 @@ def _fast_dtw_with_model(a_eps, b_eps, worker_i, queue, model):
             n, m = a.shape[0], b.shape[0]
             res = torch.zeros((n, m), dtype=torch.float32, device=dev)
             for i in range(n):
-                sim_loss = model.compute_elementwise_sim_loss(a[i].repeat(m, 1), b)
+                sim_loss = model.compute_elementwise_sim_loss(a[i].repeat(m, 1), b, reparameterize=False)
                 res[i] = sim_loss.mean(dim=1)
-            precomputed_distances = res.cpu()
+            precomputed_distances = res.cpu().numpy()
 
-        cost, path = dynamic_time_warping(a_ep, b_ep, precomputed_distances=precomputed_distances)
+        cost, path = dynamic_time_warping_c(precomputed_distances)
         a_res += list(a_ep[path[:, 0]])
         b_res += list(b_ep[path[:, 1]])
 
@@ -51,17 +53,10 @@ def _fast_dtw_with_model(a_eps, b_eps, worker_i, queue, model):
         return a_res, b_res
 
 
-class VAE(nn.Module):
+class AutoencoderBase(nn.Module):
 
-    # From : https://github.com/pytorch/examples/blob/5df464c46cf321ed1cc3df1e670358d7f5ae1887/vae/main.py#L39
-    def __init__(self, input_size: int, hidden_size: int, z_size: int):
-        super(VAE, self).__init__()
-
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc21 = nn.Linear(hidden_size, z_size)
-        self.fc22 = nn.Linear(hidden_size, z_size)
-        self.fc3 = nn.Linear(z_size, hidden_size)
-        self.fc4 = nn.Linear(hidden_size, input_size)
+    def __init__(self, input_size: int, **kwargs):
+        super(AutoencoderBase, self).__init__()
         self.input_size = input_size
 
     def reset_parameters(self):
@@ -70,19 +65,44 @@ class VAE(nn.Module):
                 m.reset_parameters()
         self.apply(reset)
 
+    def encode(self, x, **kwargs):
+        raise NotImplementedError
+
+    def decode(self, z):
+        raise NotImplementedError
+
+    def loss_function(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+class VAE(AutoencoderBase):
+
+    # From : https://github.com/pytorch/examples/blob/5df464c46cf321ed1cc3df1e670358d7f5ae1887/vae/main.py#L39
+    def __init__(self, input_size: int, hidden_size: int, z_size: int, **kwargs):
+        super(VAE, self).__init__(input_size, **kwargs)
+
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc21 = nn.Linear(hidden_size, z_size)
+        self.fc22 = nn.Linear(hidden_size, z_size)
+        self.fc3 = nn.Linear(z_size, hidden_size)
+        self.fc4 = nn.Linear(hidden_size, input_size)
+
     def _encode(self, x):
         h1 = F.relu(self.fc1(x))
         return self.fc21(h1), self.fc22(h1)
 
-    def reparameterize(self, mu, logvar):
+    def _reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def encode(self, x):
+    def encode(self, x, reparameterize=True, **kwargs):
         mu, logvar = self._encode(x.view(-1, self.input_size))
-        z = self.reparameterize(mu, logvar)
-        return z
+        if reparameterize:
+            # return z
+            return self._reparameterize(mu, logvar)
+        else:
+            return mu
 
     def decode(self, z):
         h3 = F.relu(self.fc3(z))
@@ -90,7 +110,7 @@ class VAE(nn.Module):
 
     def forward(self, x):
         mu, logvar = self._encode(x.view(-1, self.input_size))
-        z = self.reparameterize(mu, logvar)
+        z = self._reparameterize(mu, logvar)
         return z, self.decode(z), mu, logvar
 
     # From VAE example code
@@ -101,15 +121,55 @@ class VAE(nn.Module):
         return bce + kdl
 
 
+class SimpleAutoencoder(AutoencoderBase):
+
+    # From : https://github.com/pytorch/examples/blob/5df464c46cf321ed1cc3df1e670358d7f5ae1887/vae/main.py#L39
+    def __init__(self, input_size: int, hidden_size: int, z_size: int, **kwargs):
+        super(SimpleAutoencoder, self).__init__(input_size, **kwargs)
+
+        self.fc_enc1 = nn.Linear(input_size, hidden_size)
+        self.fc_enc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc_enc3 = nn.Linear(hidden_size, z_size)
+
+        self.fc_dec3 = nn.Linear(z_size, hidden_size)
+        self.fc_dec2 = nn.Linear(hidden_size, hidden_size)
+        self.fc_dec1 = nn.Linear(hidden_size, input_size)
+
+        # self.loss_function = nn.MSELoss()
+
+    def encode(self, x, **kwargs):
+        h1 = F.relu(self.fc_enc1(x.view(-1, self.input_size)))
+        h2 = F.relu(self.fc_enc2(h1))
+        z = F.relu(self.fc_enc3(h2))
+        return z
+
+    def decode(self, z):
+        h3 = F.relu(self.fc_dec3(z))
+        h2 = F.relu(self.fc_dec2(h3))
+        h1 = F.relu(self.fc_dec1(h2))
+        recon = torch.sigmoid(h1)
+        return recon
+
+    def forward(self, x):
+        z = self.encode(x)
+        recon = self.decode(z)
+        return z, recon
+
+    def loss_function(self, x, recon_x):
+        bce = F.binary_cross_entropy(recon_x, x.view(-1, self.input_size), reduction='sum')
+        return bce
+
+
 class TwinVAE:
 
-    def __init__(self, a_spec: dict, b_spec: dict, z_size: int):
+    def __init__(self, a_spec: dict, b_spec: dict, z_size: int, net_class=None):
         self.a_spec = dict(a_spec)
         self.b_spec = dict(b_spec)
         self.z_size = z_size
 
-        self.a_vae = VAE(**a_spec, z_size=z_size)
-        self.b_vae = VAE(**b_spec, z_size=z_size)
+        net_class = net_class or VAE
+        self.a_vae = net_class(**a_spec, z_size=z_size) # type: AutoencoderBase
+        self.b_vae = net_class(**b_spec, z_size=z_size) # type: AutoencoderBase
 
         self.a_loss = self.a_vae.loss_function
         self.b_loss = self.b_vae.loss_function
@@ -121,22 +181,53 @@ class TwinVAE:
     def device(self):
         return self._device
 
+    def save(self, file_path: str):
+        assert file_path.endswith(".pt")
+        torch.save(dict(
+            a_spec=self.a_spec,
+            b_spec=self.b_spec,
+            z_size=self.z_size,
+            a_vae_state=self.a_vae.state_dict(),
+            b_vae_state=self.b_vae.state_dict(),
+        ), file_path)
+
+    @staticmethod
+    def load(file_path: str):
+        assert file_path.endswith(".pt")
+        d = torch.load(file_path, map_location=lambda st, loc: st)
+        model = TwinVAE(
+            a_spec=d['a_spec'],
+            b_spec=d['b_spec'],
+            z_size=d['z_size'],
+        )
+        model.a_vae.load_state_dict(d['a_vae_state'])
+        model.b_vae.load_state_dict(d['b_vae_state'])
+        model.eval()
+        return model
+
     def reset_parameters(self):
         self.a_vae.reset_parameters()
         self.b_vae.reset_parameters()
 
-    def compute_elementwise_sim_loss(self, a_data, b_data):
-        a_z = self.a_vae.encode(a_data)
-        b_z = self.b_vae.encode(b_data)
+    def compute_elementwise_sim_loss(self, a_data, b_data, **encode_kwargs):
+        a_z = self.a_vae.encode(a_data, **encode_kwargs)
+        b_z = self.b_vae.encode(b_data, **encode_kwargs)
         return self.sim_loss_no_red(a_z, b_z)
 
     def compute_losses(self, a_data, b_data):
 
-        a_z, a_recon_x, a_mu, a_logvar = self.a_vae(a_data)
-        a_loss = self.a_loss(a_data, a_recon_x, a_mu, a_logvar)
+        if isinstance(self.a_vae, VAE):
+            a_z, a_recon_x, a_mu, a_logvar = self.a_vae(a_data)
+            a_loss = self.a_loss(a_data, a_recon_x, a_mu, a_logvar)
 
-        b_z, b_recon_x, b_mu, b_logvar = self.b_vae(b_data)
-        b_loss = self.b_loss(b_data, b_recon_x, b_mu, b_logvar)
+            b_z, b_recon_x, b_mu, b_logvar = self.b_vae(b_data)
+            b_loss = self.b_loss(b_data, b_recon_x, b_mu, b_logvar)
+        else:
+            a_z, a_recon_x = self.a_vae(a_data)
+            a_loss = self.a_loss(a_data, a_recon_x)
+
+            b_z, b_recon_x = self.b_vae(b_data)
+            b_loss = self.b_loss(b_data, b_recon_x)
 
         sim_loss = self.sim_loss(a_z, b_z)
         total_loss = a_loss + b_loss + sim_loss
@@ -160,7 +251,7 @@ class TwinVAE:
         return list(self.a_vae.parameters()) + list(self.b_vae.parameters())
 
     def clone(self):
-        c = TwinVAE(self.a_spec, self.b_spec, self.z_size)
+        c = TwinVAE(self.a_spec, self.b_spec, self.z_size, self.a_vae.__class__)
         c.a_vae.load_state_dict(self.a_vae.state_dict())
         c.b_vae.load_state_dict(self.b_vae.state_dict())
         c.to(self.device)
@@ -186,9 +277,10 @@ def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, devi
         optimizer.step()
 
         if batch_idx % log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f} (sim: {:.6f}, a: {:.6f}, b: {:.6f})'.format(
                 epoch, batch_idx * len(a_data), len(data_loader.dataset),
-                100. * batch_idx / len(data_loader), total_loss.item() / len(a_data))
+                100. * batch_idx / len(data_loader), total_loss.item() / len(a_data),
+                sim_loss.item() / len(a_data), a_loss.item() / len(a_data), b_loss.item() / len(a_data))
             )
 
     print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, train_loss / len(data_loader.dataset)))
@@ -234,6 +326,9 @@ class TwinDataset(Dataset):
             self.a_episodes = a_episodes
             self.b_episodes = b_episodes
 
+        self.a_scaler = StandardScaler()
+        self.b_scaler = StandardScaler()
+
     def __getitem__(self, idx):
         return self.a_states[idx].astype(np.float32), self.b_states[idx].astype(np.float32)
 
@@ -261,12 +356,24 @@ class TwinDataset(Dataset):
             obj = pickle.load(f)
         return TwinDataset(**obj, copy=False)
 
+    def normalize(self):
+        self.a_scaler.fit(np.zeros((1, 1)))
+        self.b_scaler.fit(np.zeros((1, 1)))
+        for i in range(2):
+            desc = 'Fitted episodes' if i == 0 else 'Normalized episodes'
+            for a_ep, b_ep in tqdm(zip(self.a_episodes, self.b_episodes), desc=desc, total=len(self.a_episodes)):
+                if i == 0:
+                    self.a_scaler.partial_fit(a_ep)
+                    self.b_scaler.partial_fit(b_ep)
+                else:
+                    self.a_scaler.transform(a_ep, copy=False)
+                    self.b_scaler.transform(b_ep, copy=False)
+
     def _extract_states(self):
         # equivalent to self.realign(lambda x, y: 0.0)
         self.a_states = []
         self.b_states = []
-        for a_ep, b_ep in tqdm(zip(self.a_episodes, self.b_episodes),
-                               desc='Processed episodes', total=len(self.a_episodes)):
+        for a_ep, b_ep in zip(self.a_episodes, self.b_episodes):
             min_len = min(len(a_ep), len(b_ep))
             self.a_states += list(a_ep[:min_len])
             self.b_states += list(b_ep[:min_len])
@@ -280,11 +387,11 @@ class TwinDataset(Dataset):
         self.b_states = []
         for a_ep, b_ep in tqdm(zip(self.a_episodes, self.b_episodes),
                                desc='Aligned episodes', total=len(self.a_episodes)):
-            cost, path = dynamic_time_warping(a_ep, b_ep, distance_fn)
+            cost, path = dynamic_time_warping_py(a_ep, b_ep, distance_fn)
             self.a_states += list(a_ep[path[:, 0]])
             self.b_states += list(b_ep[path[:, 1]])
 
-    def realign_with_model(self, model: TwinVAE, workers=7):
+    def realign_with_model(self, model: TwinVAE, workers=6):
 
         if workers == 1:
             a_res, b_res = _fast_dtw_with_model(self.a_episodes, self.b_episodes, 0, None, model)
@@ -320,7 +427,8 @@ class TwinDataset(Dataset):
             worker_i, (a_res, b_res) = queue.get()
             a_states[worker_i] = a_res
             b_states[worker_i] = b_res
-            print(f'Worker {worker_i} done.')
+            if worker_i == 0:
+                print(f'Waiting for other workers...')
 
         self.a_states = sum(a_states, [])
         self.b_states = sum(b_states, [])
@@ -338,14 +446,17 @@ class TwinDataset(Dataset):
 
 
 def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42,
-          n_workers=1, n_epochs=100, batch_size=256):
+          n_workers=1, n_cycles=10, n_epochs=3, batch_size=128, net_class=None):
 
+    checkpoints_dir = local_dir + '/checkpoints'
+    os.makedirs(checkpoints_dir, exist_ok=True)
     torch.manual_seed(seed)
 
     model = TwinVAE(
-        a_spec=dict(input_size=training_set.a_item_size, hidden_size=32),
-        b_spec=dict(input_size=training_set.b_item_size, hidden_size=16),
-        z_size=4
+        a_spec=dict(input_size=training_set.a_item_size, hidden_size=60),
+        b_spec=dict(input_size=training_set.b_item_size, hidden_size=60),
+        z_size=8,
+        net_class=net_class
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -353,20 +464,24 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
 
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-    print('Initial alignment of datasets...')
     training_set.preprocess()
     test_set.preprocess()
 
     training_data_loader = DataLoader(dataset=training_set, num_workers=n_workers, batch_size=batch_size, shuffle=True)
     test_data_loader = DataLoader(dataset=test_set, num_workers=n_workers, batch_size=batch_size, shuffle=False)
 
-    for epoch in range(n_epochs):
+    for cycle in range(n_cycles):
 
-        print('Training...')
-        _training_step(model, optimizer, training_data_loader, device, epoch, log_interval=100)
+        for epoch in range(n_epochs):
 
-        print('Evaluating...')
-        _evaluation_step(model, test_data_loader, device)
+            print('Training...')
+            _training_step(model, optimizer, training_data_loader, device, epoch, log_interval=100)
+
+            print('Evaluating...')
+            _evaluation_step(model, test_data_loader, device)
+
+        print('Saving checkpoint...')
+        model.save(f'{checkpoints_dir}/model_c{cycle}.pt')
 
         print('Realigning test dataset...')
         test_set.realign_with_model(model)
@@ -480,19 +595,83 @@ def _generate_twin_dataset(file_path, n=1_000, max_ep_steps=200, seed=42, render
     dataset.save(file_path, with_aligned_states=False)
 
 
+def _test_dwt_on_dataset(dataset: TwinDataset):
+
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+    from sklearn.metrics.pairwise import euclidean_distances
+
+    def distance_fn(a, b):
+        a_obj_pos = a[3:6] # fetch env
+        b_obj_pos = b[63:66] # hand env
+        return np.linalg.norm(a_obj_pos - b_obj_pos)
+
+    def plot_obj_traj(a, b):
+        from mpl_toolkits.mplot3d import Axes3D
+        a_obj_traj = a[:, 3:6] # fetch env
+        b_obj_traj = b[:, 63:66] # hand env
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        ax.plot(*a_obj_traj.T, label='Fetch')
+        ax.plot(*b_obj_traj.T, label='Hand')
+        ax.legend()
+        plt.show()
+
+    for a_ep, b_ep in zip(dataset.a_episodes, dataset.b_episodes):
+        plot_obj_traj(a_ep, b_ep)
+        cost, path = dynamic_time_warping_py(a_ep, b_ep, distance_fn)
+        plt.imshow(cost.T, origin='lower', cmap=cm.gray, interpolation='nearest')
+        plt.plot(*path.T, 'w')
+        plt.show()
+
+
+def _test_reconstruction(dataset: TwinDataset, model: TwinVAE):
+
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+
+    def plot_obj_traj(a, b):
+        from mpl_toolkits.mplot3d import Axes3D
+        a_obj_traj = a[:, 63:66] # fetch env
+        b_obj_traj = b[:, 63:66] # hand env
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        ax.plot(*a_obj_traj.T, label='A')
+        ax.plot(*b_obj_traj.T, label='B')
+        ax.legend()
+        plt.show()
+
+    dev = torch.device('cuda')
+    model.to(dev)
+
+    for a_ep, b_ep in zip(dataset.a_episodes, dataset.b_episodes):
+        with torch.no_grad():
+            ep = torch.tensor(b_ep, dtype=torch.float32, device=dev)
+            recon = model.b_vae.forward(ep)[1].cpu().numpy()
+        plot_obj_traj(b_ep, recon)
+
+
 if __name__ == '__main__':
     # _generate_twin_dataset(file_path='../out/pp_twin_dataset_10k.pkl', n=10_000, render=False)
 
     _full_dataset = TwinDataset.load('../out/pp_twin_dataset_10k.pkl')
+    _full_dataset.normalize()
+
+    # _test_dwt_on_dataset(_full_dataset)
+    # exit(0)
+
+    # _test_reconstruction(_full_dataset, model=TwinVAE.load('../out/pp_twin_test/checkpoints/model_e0.pt'))
+
     _training_set, _test_set = _full_dataset.split(
         shuffle=True,
         test_size=0.25,
         train_size=None,
-        seed=42
+        seed=42,
     )
 
     train(
         training_set=_training_set,
         test_set=_test_set,
-        local_dir='../out/pp_twin_test'
+        local_dir='../out/pp_twin_simple_test',
+        net_class=VAE,
     )
