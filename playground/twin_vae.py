@@ -123,32 +123,33 @@ class VAE(AutoencoderBase):
 
 class SimpleAutoencoder(AutoencoderBase):
 
-    # From : https://github.com/pytorch/examples/blob/5df464c46cf321ed1cc3df1e670358d7f5ae1887/vae/main.py#L39
     def __init__(self, input_size: int, hidden_size: int, z_size: int, **kwargs):
         super(SimpleAutoencoder, self).__init__(input_size, **kwargs)
 
-        self.fc_enc1 = nn.Linear(input_size, hidden_size)
-        self.fc_enc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc_enc3 = nn.Linear(hidden_size, z_size)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(True),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(True),
+            nn.Linear(hidden_size, z_size),
+        )
 
-        self.fc_dec3 = nn.Linear(z_size, hidden_size)
-        self.fc_dec2 = nn.Linear(hidden_size, hidden_size)
-        self.fc_dec1 = nn.Linear(hidden_size, input_size)
+        self.decoder = nn.Sequential(
+            nn.Linear(z_size, hidden_size),
+            nn.ReLU(True),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(True),
+            nn.Linear(hidden_size, input_size),
+            nn.Tanh()
+        )
 
-        # self.loss_function = nn.MSELoss()
+        self._loss_fn = nn.MSELoss(reduction='sum')
 
     def encode(self, x, **kwargs):
-        h1 = F.relu(self.fc_enc1(x.view(-1, self.input_size)))
-        h2 = F.relu(self.fc_enc2(h1))
-        z = F.relu(self.fc_enc3(h2))
-        return z
+        return self.encoder(x)
 
     def decode(self, z):
-        h3 = F.relu(self.fc_dec3(z))
-        h2 = F.relu(self.fc_dec2(h3))
-        h1 = F.relu(self.fc_dec1(h2))
-        recon = torch.sigmoid(h1)
-        return recon
+        return self.decoder(z)
 
     def forward(self, x):
         z = self.encode(x)
@@ -156,8 +157,7 @@ class SimpleAutoencoder(AutoencoderBase):
         return z, recon
 
     def loss_function(self, x, recon_x):
-        bce = F.binary_cross_entropy(recon_x, x.view(-1, self.input_size), reduction='sum')
-        return bce
+        return self._loss_fn(recon_x, x.view(-1, self.input_size))
 
 
 class TwinVAE:
@@ -173,7 +173,7 @@ class TwinVAE:
 
         self.a_loss = self.a_vae.loss_function
         self.b_loss = self.b_vae.loss_function
-        self.sim_loss = nn.MSELoss()
+        self.sim_loss = nn.MSELoss(reduction='sum')
         self.sim_loss_no_red = nn.MSELoss(reduction='none')
         self._device = torch.device('cpu')
 
@@ -192,13 +192,14 @@ class TwinVAE:
         ), file_path)
 
     @staticmethod
-    def load(file_path: str):
+    def load(file_path: str, net_class):
         assert file_path.endswith(".pt")
         d = torch.load(file_path, map_location=lambda st, loc: st)
         model = TwinVAE(
             a_spec=d['a_spec'],
             b_spec=d['b_spec'],
             z_size=d['z_size'],
+            net_class=net_class,
         )
         model.a_vae.load_state_dict(d['a_vae_state'])
         model.b_vae.load_state_dict(d['b_vae_state'])
@@ -260,10 +261,15 @@ class TwinVAE:
 
 def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, device, epoch: int, log_interval=1):
     model.train()
-    train_loss = 0
+    avg_tot_loss = 0.0
+    avg_sim_loss = 0.0
+    avg_a_loss = 0.0
+    avg_b_loss = 0.0
+    ds_size = len(data_loader.dataset)
 
     for batch_idx, (a_data, b_data) in enumerate(data_loader):
 
+        b_size = len(a_data)
         a_data = a_data.to(device)
         b_data = b_data.to(device)
 
@@ -271,19 +277,28 @@ def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, devi
         losses = model.compute_losses(a_data, b_data)
         total_loss, a_loss, b_loss, sim_loss = losses
 
-        total_loss.backward()
+        avg_tot_loss += total_loss.item()
+        avg_a_loss += a_loss.item()
+        avg_b_loss += b_loss.item()
+        avg_sim_loss += sim_loss.item()
 
-        train_loss += total_loss.item()
-        optimizer.step()
+        total_loss.backward()
+        optimizer.step(None)
 
         if batch_idx % log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f} (sim: {:.6f}, a: {:.6f}, b: {:.6f})'.format(
-                epoch, batch_idx * len(a_data), len(data_loader.dataset),
-                100. * batch_idx / len(data_loader), total_loss.item() / len(a_data),
-                sim_loss.item() / len(a_data), a_loss.item() / len(a_data), b_loss.item() / len(a_data))
+                epoch, batch_idx * b_size, ds_size, 100. * batch_idx / len(data_loader), total_loss.item() / b_size,
+                sim_loss.item() / b_size, a_loss.item() / b_size, b_loss.item() / b_size)
             )
 
-    print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, train_loss / len(data_loader.dataset)))
+    avg_tot_loss /= ds_size
+    avg_a_loss /= ds_size
+    avg_b_loss /= ds_size
+    avg_sim_loss /= ds_size
+
+    print('====> Epoch: {} Average loss: {:.4f} (sim: {:.6f}, a: {:.6f}, b: {:.6f})'.format(
+        epoch, avg_tot_loss, avg_sim_loss, avg_a_loss, avg_b_loss
+    ))
 
 
 def _evaluation_step(model: TwinVAE, data_loader, device):
@@ -446,7 +461,7 @@ class TwinDataset(Dataset):
 
 
 def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42,
-          n_workers=1, n_cycles=10, n_epochs=3, batch_size=128, net_class=None):
+          n_workers=2, n_cycles=10, n_epochs=5, batch_size=256, net_class=None):
 
     checkpoints_dir = local_dir + '/checkpoints'
     os.makedirs(checkpoints_dir, exist_ok=True)
@@ -455,7 +470,7 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
     model = TwinVAE(
         a_spec=dict(input_size=training_set.a_item_size, hidden_size=60),
         b_spec=dict(input_size=training_set.b_item_size, hidden_size=60),
-        z_size=8,
+        z_size=12,
         net_class=net_class
     )
 
@@ -632,12 +647,14 @@ def _test_reconstruction(dataset: TwinDataset, model: TwinVAE):
 
     def plot_obj_traj(a, b):
         from mpl_toolkits.mplot3d import Axes3D
-        a_obj_traj = a[:, 63:66] # fetch env
-        b_obj_traj = b[:, 63:66] # hand env
+        # a_obj_traj = a[:, 63:66] # hand env
+        # b_obj_traj = b[:, 63:66]
+        a_obj_traj = a[:, 3:6] # fetch env
+        b_obj_traj = b[:, 3:6]
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
-        ax.plot(*a_obj_traj.T, label='A')
-        ax.plot(*b_obj_traj.T, label='B')
+        ax.plot(*a_obj_traj.T, label='orig')
+        ax.plot(*b_obj_traj.T, label='recon')
         ax.legend()
         plt.show()
 
@@ -646,9 +663,69 @@ def _test_reconstruction(dataset: TwinDataset, model: TwinVAE):
 
     for a_ep, b_ep in zip(dataset.a_episodes, dataset.b_episodes):
         with torch.no_grad():
-            ep = torch.tensor(b_ep, dtype=torch.float32, device=dev)
-            recon = model.b_vae.forward(ep)[1].cpu().numpy()
-        plot_obj_traj(b_ep, recon)
+            ep = torch.tensor(a_ep, dtype=torch.float32, device=dev)
+            recon = model.a_vae.forward(ep)[1].cpu().numpy()
+        plot_obj_traj(a_ep, recon)
+
+
+def _test_sim_loss(dataset: TwinDataset, model: TwinVAE):
+
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+
+    dev = torch.device('cuda')
+    model.to(dev)
+
+    for a_ep, b_ep in zip(dataset.a_episodes, dataset.b_episodes):
+        with torch.no_grad():
+            a_ep_t = torch.tensor(a_ep, dtype=torch.float32, device=dev)
+            b_ep_t = torch.tensor(b_ep, dtype=torch.float32, device=dev)
+            n, m = a_ep_t.shape[0], b_ep_t.shape[0]
+            res = torch.zeros((n, m), dtype=torch.float32, device=dev)
+            for i in range(n):
+                sim_loss = model.compute_elementwise_sim_loss(a_ep_t[i].repeat(m, 1), b_ep_t, reparameterize=False)
+                res[i] = sim_loss.mean(dim=1)
+            res = res.cpu().numpy()
+
+        sim = np.diag(res)
+        cost, path = dynamic_time_warping_c(res)
+        a_ep_s = dataset.a_scaler.inverse_transform(a_ep, copy=True)
+        b_ep_s = dataset.b_scaler.inverse_transform(b_ep, copy=True)
+        a_dtw_s = a_ep_s[path[:, 0]]
+        b_dtw_s = b_ep_s[path[:, 1]]
+        sim_dtw = res[path[:, 0], path[:, 1]]
+
+        a_ag = a_ep_s[:, 3:6]
+        b_ag = b_ep_s[:, 63:66]
+        g = b_ep_s[0, -7:-4]
+
+        fig, axes = plt.subplots(2, 2)
+
+        axes[0, 0].imshow(res, origin='lower', cmap=cm.gist_stern, interpolation='nearest')
+        axes[0, 0].plot(path[:, 1], path[:, 0], 'w')
+
+        a = np.linalg.norm(a_ag - g, axis=1)
+        b = np.linalg.norm(b_ag - g, axis=1)
+        axes[1, 0].plot(a, label="A")
+        axes[1, 0].plot(b, label="B")
+        axes[1, 0].plot(-sim, label="sim")
+        axes[1, 0].plot(-np.abs(a - b), label="diff")
+        axes[1, 0].grid()
+        axes[1, 0].legend()
+
+        axes[0, 1].imshow(cost, origin='lower', cmap=cm.gist_stern, interpolation='nearest')
+        axes[0, 1].plot(path[:, 1], path[:, 0], 'w')
+
+        a = np.linalg.norm(a_dtw_s[:, 3:6] - b_dtw_s[0, -7:-4], axis=1)
+        b = np.linalg.norm(b_dtw_s[:, 63:66] - b_dtw_s[0, -7:-4], axis=1)
+        axes[1, 1].plot(a, label="A")
+        axes[1, 1].plot(b, label="B")
+        axes[1, 1].plot(-sim_dtw, label="sim")
+        axes[1, 1].plot(-np.abs(a - b), label="diff")
+        axes[1, 1].grid()
+        axes[1, 1].legend()
+
+        plt.show()
 
 
 if __name__ == '__main__':
@@ -660,7 +737,13 @@ if __name__ == '__main__':
     # _test_dwt_on_dataset(_full_dataset)
     # exit(0)
 
-    # _test_reconstruction(_full_dataset, model=TwinVAE.load('../out/pp_twin_test/checkpoints/model_e0.pt'))
+    # _test_reconstruction(_full_dataset, model=TwinVAE.load('../out/pp_twin_simple_test/checkpoints/model_c2.pt',
+    #                                                        net_class=SimpleAutoencoder))
+    # exit(0)
+
+    # _test_sim_loss(_full_dataset, model=TwinVAE.load('../out/pp_twin_ae_test/checkpoints/model_c9.pt',
+    #                                                  net_class=SimpleAutoencoder))
+    # exit(0)
 
     _training_set, _test_set = _full_dataset.split(
         shuffle=True,
@@ -672,6 +755,6 @@ if __name__ == '__main__':
     train(
         training_set=_training_set,
         test_set=_test_set,
-        local_dir='../out/pp_twin_simple_test',
-        net_class=VAE,
+        local_dir='../out/pp_twin_ae_test',
+        net_class=SimpleAutoencoder,
     )
