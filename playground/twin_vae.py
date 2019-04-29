@@ -175,6 +175,7 @@ class TwinVAE:
         self.b_loss = self.b_vae.loss_function
         self.sim_loss = nn.MSELoss(reduction='sum')
         self.sim_loss_no_red = nn.MSELoss(reduction='none')
+        self.normalize_losses = True
         self._device = torch.device('cpu')
 
     @property
@@ -231,6 +232,12 @@ class TwinVAE:
             b_loss = self.b_loss(b_data, b_recon_x)
 
         sim_loss = self.sim_loss(a_z, b_z)
+
+        if self.normalize_losses:
+            a_loss /= self.a_vae.input_size
+            b_loss /= self.b_vae.input_size
+            sim_loss /= self.z_size
+
         total_loss = a_loss + b_loss + sim_loss
 
         return total_loss, a_loss, b_loss, sim_loss
@@ -461,7 +468,7 @@ class TwinDataset(Dataset):
 
 
 def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42,
-          n_workers=2, n_cycles=10, n_epochs=5, batch_size=256, net_class=None):
+          n_workers=2, n_cycles=50, n_epochs=10, batch_size=128, net_class=None):
 
     checkpoints_dir = local_dir + '/checkpoints'
     os.makedirs(checkpoints_dir, exist_ok=True)
@@ -470,14 +477,16 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
     model = TwinVAE(
         a_spec=dict(input_size=training_set.a_item_size, hidden_size=60),
         b_spec=dict(input_size=training_set.b_item_size, hidden_size=60),
-        z_size=12,
+        z_size=15,
         net_class=net_class
     )
+
+    model.normalize_losses = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
     training_set.preprocess()
     test_set.preprocess()
@@ -487,15 +496,18 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
 
     for cycle in range(n_cycles):
 
+        print(('\n' + '-' * 100) * 2)
+        print(f'====> Cycle {cycle + 1}/{n_cycles}')
+
         for epoch in range(n_epochs):
 
-            print('Training...')
+            print('\nTraining...')
             _training_step(model, optimizer, training_data_loader, device, epoch, log_interval=100)
 
-            print('Evaluating...')
+            print('\nEvaluating...')
             _evaluation_step(model, test_data_loader, device)
 
-        print('Saving checkpoint...')
+        print('\nSaving checkpoint...')
         model.save(f'{checkpoints_dir}/model_c{cycle}.pt')
 
         print('Realigning test dataset...')
@@ -604,8 +616,111 @@ def _generate_twin_episodes(n=1_000, max_ep_steps=200, seed=42, render=False):
     return a_episodes, b_episodes
 
 
-def _generate_twin_dataset(file_path, n=1_000, max_ep_steps=200, seed=42, render=False):
-    a_episodes, b_episodes = _generate_twin_episodes(n=n, max_ep_steps=max_ep_steps, seed=seed, render=render)
+def _generate_twin_episodes_yumi(n=1_000, max_ep_steps=200, seed=42, render=False):
+
+    import gym
+    from gym.envs.yumi import YumiConstrainedEnv
+    from gym.envs.robotics import HandPickAndPlaceEnv
+    from gym.agents.yumi import YumiConstrainedAgent
+    from gym.agents.shadow_hand import HandPickAndPlaceAgent
+    from gym.utils import transformations as tf
+
+    def flatten_obs(obs_dict):
+        return np.r_[obs_dict['observation'], obs_dict['desired_goal']]
+
+    a_env = gym.make(
+        'YumiConstrained-v1'
+    ).unwrapped # type: YumiConstrainedEnv
+
+    b_env = gym.make(
+        'HandPickAndPlace-v0',
+        ignore_rotation_ctrl=True,
+        ignore_target_rotation=True,
+        success_on_grasp_only=False,
+        randomize_initial_arm_pos=True,
+        randomize_initial_object_pos=True,
+        object_id='box'
+    ).unwrapped # type: HandPickAndPlaceEnv
+
+    a_env.seed(seed)
+    b_env.seed(seed)
+
+    a_agent = YumiConstrainedAgent(a_env)
+    b_agent = HandPickAndPlaceAgent(b_env)
+
+    a_episodes = []
+    b_episodes = []
+    prog = tqdm(total=n, desc='Recorded episodes')
+
+    a_table_tf = a_env.get_table_surface_pose()
+    b_table_tf = b_env.get_table_surface_pose()
+
+    while len(a_episodes) < n:
+
+        a_states = []
+        b_states = []
+
+        a_env.reset()
+        b_env.reset()
+
+        t_to_goal = tf.get_tf(np.r_[a_env.goal, 1., 0., 0., 0.], a_table_tf)
+        b_goal_pose = tf.apply_tf(t_to_goal, b_table_tf)
+
+        b_env.goal = np.r_[b_goal_pose[:3], np.zeros(4)]
+
+        t_to_obj = tf.get_tf(a_env.get_object_pose(), a_table_tf)
+        b_obj_pose = tf.apply_tf(t_to_obj, b_table_tf)
+
+        object_pos = b_env.sim.data.get_joint_qpos('object:joint').copy()
+        object_pos[:2] = b_obj_pose[:2]
+        b_env.sim.data.set_joint_qpos('object:joint', object_pos)
+        b_env.sim.forward()
+
+        a_agent.reset()
+        b_agent.reset()
+
+        a_obs = a_env._get_obs()
+        b_obs = b_env._get_obs()
+
+        a_states.append(flatten_obs(a_obs))
+        b_states.append(flatten_obs(b_obs))
+
+        success = False
+
+        for _ in range(max_ep_steps):
+
+            a_action = a_agent.predict(a_obs)
+            b_action = b_agent.predict(b_obs)
+
+            a_obs, a_rew, a_done, a_info = a_env.step(a_action)
+            b_obs, b_rew, b_done, b_info = b_env.step(b_action)
+
+            a_states.append(flatten_obs(a_obs))
+            b_states.append(flatten_obs(b_obs))
+
+            if render:
+                a_env.render()
+                b_env.render()
+
+            success = a_info['is_success'] == 1.0 and b_info['is_success'] == 1.0
+            if success:
+                break
+
+            if a_done or b_done:
+                break
+
+        if success:
+            prog.update()
+            a_episodes.append(np.array(a_states))
+            b_episodes.append(np.array(b_states))
+
+    prog.close()
+    return a_episodes, b_episodes
+
+
+def _generate_twin_dataset(file_path, n=1_000, max_ep_steps=200, seed=42, render=False, generator=None):
+    generator = generator or _generate_twin_episodes
+    a_episodes, b_episodes = generator(n=n, max_ep_steps=max_ep_steps, seed=seed, render=render)
     dataset = TwinDataset(a_episodes=a_episodes, b_episodes=b_episodes, copy=False)
     dataset.save(file_path, with_aligned_states=False)
 
@@ -668,7 +783,7 @@ def _test_reconstruction(dataset: TwinDataset, model: TwinVAE):
         plot_obj_traj(a_ep, recon)
 
 
-def _test_sim_loss(dataset: TwinDataset, model: TwinVAE):
+def _test_sim_loss(dataset: TwinDataset, model: TwinVAE, a_get_ag, a_get_g, b_get_ag, b_get_g):
 
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
@@ -695,17 +810,18 @@ def _test_sim_loss(dataset: TwinDataset, model: TwinVAE):
         b_dtw_s = b_ep_s[path[:, 1]]
         sim_dtw = res[path[:, 0], path[:, 1]]
 
-        a_ag = a_ep_s[:, 3:6]
-        b_ag = b_ep_s[:, 63:66]
-        g = b_ep_s[0, -7:-4]
+        a_ag = a_get_ag(a_ep_s)
+        a_g = a_get_g(a_ep_s)
+        b_ag = b_get_ag(b_ep_s)
+        b_g = b_get_g(b_ep_s)
 
-        fig, axes = plt.subplots(2, 2)
+        fig, axes = plt.subplots(2, 2, figsize=(13, 10))
 
         axes[0, 0].imshow(res, origin='lower', cmap=cm.gist_stern, interpolation='nearest')
         axes[0, 0].plot(path[:, 1], path[:, 0], 'w')
 
-        a = np.linalg.norm(a_ag - g, axis=1)
-        b = np.linalg.norm(b_ag - g, axis=1)
+        a = np.linalg.norm(a_ag - a_g, axis=1)
+        b = np.linalg.norm(b_ag - b_g, axis=1)
         axes[1, 0].plot(a, label="A")
         axes[1, 0].plot(b, label="B")
         axes[1, 0].plot(-sim, label="sim")
@@ -716,8 +832,8 @@ def _test_sim_loss(dataset: TwinDataset, model: TwinVAE):
         axes[0, 1].imshow(cost, origin='lower', cmap=cm.gist_stern, interpolation='nearest')
         axes[0, 1].plot(path[:, 1], path[:, 0], 'w')
 
-        a = np.linalg.norm(a_dtw_s[:, 3:6] - b_dtw_s[0, -7:-4], axis=1)
-        b = np.linalg.norm(b_dtw_s[:, 63:66] - b_dtw_s[0, -7:-4], axis=1)
+        a = np.linalg.norm(a_get_ag(a_dtw_s) - a_get_g(a_dtw_s), axis=1)
+        b = np.linalg.norm(b_get_ag(b_dtw_s) - b_get_g(b_dtw_s), axis=1)
         axes[1, 1].plot(a, label="A")
         axes[1, 1].plot(b, label="B")
         axes[1, 1].plot(-sim_dtw, label="sim")
@@ -730,8 +846,11 @@ def _test_sim_loss(dataset: TwinDataset, model: TwinVAE):
 
 if __name__ == '__main__':
     # _generate_twin_dataset(file_path='../out/pp_twin_dataset_10k.pkl', n=10_000, render=False)
+    # _generate_twin_dataset(file_path='../out/pp_yumi_twin_dataset_3k.pkl', n=3_000, render=False,
+    #                        generator=_generate_twin_episodes_yumi, max_ep_steps=110)
 
-    _full_dataset = TwinDataset.load('../out/pp_twin_dataset_10k.pkl')
+    # _full_dataset = TwinDataset.load('../out/pp_twin_dataset_10k.pkl')
+    _full_dataset = TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl')
     _full_dataset.normalize()
 
     # _test_dwt_on_dataset(_full_dataset)
@@ -741,8 +860,25 @@ if __name__ == '__main__':
     #                                                        net_class=SimpleAutoencoder))
     # exit(0)
 
-    # _test_sim_loss(_full_dataset, model=TwinVAE.load('../out/pp_twin_ae_test/checkpoints/model_c9.pt',
-    #                                                  net_class=SimpleAutoencoder))
+    # _test_sim_loss(
+    #     _full_dataset,
+    #     model=TwinVAE.load('../out/pp_twin_ae_test/checkpoints/model_c9.pt',
+    #                        net_class=SimpleAutoencoder),
+    #     a_get_ag=lambda x: x[:, 3:6],
+    #     b_get_ag=lambda x: x[:, 63:66],
+    #     a_get_g=lambda x: x[0, -7:-4],
+    #     b_get_g=lambda x: x[0, -7:-4],
+    # )
+
+    # _test_sim_loss(
+    #     _full_dataset,
+    #     model=TwinVAE.load('../out/pp_yumi_twin_ae_test/checkpoints/model_c9.pt',
+    #                        net_class=SimpleAutoencoder),
+    #     a_get_ag=lambda x: x[:, 18:21],
+    #     b_get_ag=lambda x: x[:, 63:66],
+    #     a_get_g=lambda x: x[0, -3:],
+    #     b_get_g=lambda x: x[0, -7:-4],
+    # )
     # exit(0)
 
     _training_set, _test_set = _full_dataset.split(
@@ -755,6 +891,6 @@ if __name__ == '__main__':
     train(
         training_set=_training_set,
         test_set=_test_set,
-        local_dir='../out/pp_twin_ae_test',
+        local_dir='../out/pp_yumi_twin_ae_test_z15',
         net_class=SimpleAutoencoder,
     )
