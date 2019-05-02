@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+from tensorboardX import SummaryWriter
 
 from thesis_tools.dtw import dynamic_time_warping_c, dynamic_time_warping_py
 
@@ -162,7 +163,7 @@ class SimpleAutoencoder(AutoencoderBase):
 
 class TwinVAE:
 
-    def __init__(self, a_spec: dict, b_spec: dict, z_size: int, net_class=None):
+    def __init__(self, a_spec: dict, b_spec: dict, z_size: int, net_class=None, normalize_losses=False):
         self.a_spec = dict(a_spec)
         self.b_spec = dict(b_spec)
         self.z_size = z_size
@@ -175,7 +176,7 @@ class TwinVAE:
         self.b_loss = self.b_vae.loss_function
         self.sim_loss = nn.MSELoss(reduction='sum')
         self.sim_loss_no_red = nn.MSELoss(reduction='none')
-        self.normalize_losses = True
+        self.normalize_losses = normalize_losses
         self._device = torch.device('cpu')
 
     @property
@@ -242,7 +243,16 @@ class TwinVAE:
 
         return total_loss, a_loss, b_loss, sim_loss
 
+    def compute_obs_sim_loss(self, a_obs, b_obs):
+        with torch.no_grad():
+            a = torch.tensor(a_obs[None], dtype=torch.float32, device=self.device)
+            b = torch.tensor(b_obs[None], dtype=torch.float32, device=self.device)
+            sim_loss = self.compute_elementwise_sim_loss(a, b, reparameterize=False)[0]
+        return sim_loss.cpu().numpy()
+
     def to(self, device):
+        if isinstance(device, str):
+            device = torch.device(device)
         self.a_vae = self.a_vae.to(device)
         self.b_vae = self.b_vae.to(device)
         self._device = device
@@ -266,7 +276,8 @@ class TwinVAE:
         return c
 
 
-def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, device, epoch: int, log_interval=1):
+def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, device, epoch: int, log_interval=1,
+                   writer: SummaryWriter = None, global_step: int = None):
     model.train()
     avg_tot_loss = 0.0
     avg_sim_loss = 0.0
@@ -302,26 +313,52 @@ def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, devi
     avg_a_loss /= ds_size
     avg_b_loss /= ds_size
     avg_sim_loss /= ds_size
-
     print('====> Epoch: {} Average loss: {:.4f} (sim: {:.6f}, a: {:.6f}, b: {:.6f})'.format(
         epoch, avg_tot_loss, avg_sim_loss, avg_a_loss, avg_b_loss
     ))
 
+    if writer is not None:
+        writer.add_scalar(tag='training_loss/avg_total', scalar_value=avg_tot_loss, global_step=global_step)
+        writer.add_scalar(tag='training_loss/avg_a_loss', scalar_value=avg_a_loss, global_step=global_step)
+        writer.add_scalar(tag='training_loss/avg_b_loss', scalar_value=avg_b_loss, global_step=global_step)
+        writer.add_scalar(tag='training_loss/avg_sim_loss', scalar_value=avg_sim_loss, global_step=global_step)
 
-def _evaluation_step(model: TwinVAE, data_loader, device):
+
+def _evaluation_step(model: TwinVAE, data_loader, device, writer: SummaryWriter = None, global_step: int = None):
     model.eval()
-    test_loss = 0
+    avg_tot_loss = 0.0
+    avg_sim_loss = 0.0
+    avg_a_loss = 0.0
+    avg_b_loss = 0.0
+    ds_size = len(data_loader.dataset)
+
     with torch.no_grad():
         for i, (a_data, b_data) in enumerate(data_loader):
 
             a_data = a_data.to(device)
             b_data = b_data.to(device)
 
-            total_loss = model.compute_losses(a_data, b_data)[0]
-            test_loss += total_loss.item()
+            losses = model.compute_losses(a_data, b_data)
+            total_loss, a_loss, b_loss, sim_loss = losses
 
-    test_loss /= len(data_loader.dataset)
-    print('====> Test set loss: {:.4f}'.format(test_loss))
+            avg_tot_loss += total_loss.item()
+            avg_a_loss += a_loss.item()
+            avg_b_loss += b_loss.item()
+            avg_sim_loss += sim_loss.item()
+
+    avg_tot_loss /= ds_size
+    avg_a_loss /= ds_size
+    avg_b_loss /= ds_size
+    avg_sim_loss /= ds_size
+    print('====> Test average loss: {:.4f} (sim: {:.6f}, a: {:.6f}, b: {:.6f})'.format(
+        avg_tot_loss, avg_sim_loss, avg_a_loss, avg_b_loss
+    ))
+
+    if writer is not None:
+        writer.add_scalar(tag='test_loss/avg_total', scalar_value=avg_tot_loss, global_step=global_step)
+        writer.add_scalar(tag='test_loss/avg_a_loss', scalar_value=avg_a_loss, global_step=global_step)
+        writer.add_scalar(tag='test_loss/avg_b_loss', scalar_value=avg_b_loss, global_step=global_step)
+        writer.add_scalar(tag='test_loss/avg_sim_loss', scalar_value=avg_sim_loss, global_step=global_step)
 
 
 class TwinDataset(Dataset):
@@ -467,26 +504,42 @@ class TwinDataset(Dataset):
         return self.b_episodes[0].shape[1]
 
 
-def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42,
-          n_workers=2, n_cycles=50, n_epochs=10, batch_size=128, net_class=None):
+def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42, learning_rate=1e-4,
+          n_workers=2, n_cycles=50, n_epochs=3, batch_size=128, net_class=None, new_params_each_cycle=False):
 
     checkpoints_dir = local_dir + '/checkpoints'
     os.makedirs(checkpoints_dir, exist_ok=True)
     torch.manual_seed(seed)
 
-    model = TwinVAE(
+    writer = SummaryWriter(log_dir=local_dir)
+
+    model_config = dict(
         a_spec=dict(input_size=training_set.a_item_size, hidden_size=60),
         b_spec=dict(input_size=training_set.b_item_size, hidden_size=60),
         z_size=15,
-        net_class=net_class
+        net_class=net_class,
+        normalize_losses=False,
     )
 
-    model.normalize_losses = False
+    other_info = dict(
+        learning_rate=learning_rate,
+        new_params_each_cycle=new_params_each_cycle,
+        n_cycles=n_cycles,
+        n_epochs=n_epochs,
+        batch_size=batch_size,
+        seed=seed,
+        training_set_size=len(training_set),
+        test_set_size=len(test_set),
+    )
+
+    pp_info = json.dumps({**model_config, **other_info}, default=lambda x: x.__name__, sort_keys=True, indent=4)
+    writer.add_text(text_string=pp_info, tag="config")
+    model = TwinVAE(**model_config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     training_set.preprocess()
     test_set.preprocess()
@@ -494,18 +547,23 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
     training_data_loader = DataLoader(dataset=training_set, num_workers=n_workers, batch_size=batch_size, shuffle=True)
     test_data_loader = DataLoader(dataset=test_set, num_workers=n_workers, batch_size=batch_size, shuffle=False)
 
+    global_step = 0
     for cycle in range(n_cycles):
 
         print(('\n' + '-' * 100) * 2)
         print(f'====> Cycle {cycle + 1}/{n_cycles}')
+        writer.add_scalar(tag='progress/cycle', scalar_value=cycle, global_step=global_step)
 
         for epoch in range(n_epochs):
+            global_step += 1
 
             print('\nTraining...')
-            _training_step(model, optimizer, training_data_loader, device, epoch, log_interval=100)
+            writer.add_scalar(tag='progress/epoch', scalar_value=epoch, global_step=global_step)
+            _training_step(model, optimizer, training_data_loader, device, epoch, log_interval=100,
+                           writer=writer, global_step=global_step)
 
             print('\nEvaluating...')
-            _evaluation_step(model, test_data_loader, device)
+            _evaluation_step(model, test_data_loader, device, writer=writer, global_step=global_step)
 
         print('\nSaving checkpoint...')
         model.save(f'{checkpoints_dir}/model_c{cycle}.pt')
@@ -516,8 +574,9 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
         print('Realigning training dataset...')
         training_set.realign_with_model(model)
 
-        print('Resetting params...')
-        model.reset_parameters()
+        if new_params_each_cycle:
+            print('Resetting params...')
+            model.reset_parameters()
 
 
 def _generate_twin_episodes(n=1_000, max_ep_steps=200, seed=42, render=False):
@@ -870,16 +929,16 @@ if __name__ == '__main__':
     #     b_get_g=lambda x: x[0, -7:-4],
     # )
 
-    # _test_sim_loss(
-    #     _full_dataset,
-    #     model=TwinVAE.load('../out/pp_yumi_twin_ae_test/checkpoints/model_c9.pt',
-    #                        net_class=SimpleAutoencoder),
-    #     a_get_ag=lambda x: x[:, 18:21],
-    #     b_get_ag=lambda x: x[:, 63:66],
-    #     a_get_g=lambda x: x[0, -3:],
-    #     b_get_g=lambda x: x[0, -7:-4],
-    # )
-    # exit(0)
+    _test_sim_loss(
+        _full_dataset,
+        model=TwinVAE.load('../out/pp_yumi_twin_ae_test_z15/checkpoints/model_c49.pt',
+                           net_class=SimpleAutoencoder),
+        a_get_ag=lambda x: x[:, 18:21],
+        b_get_ag=lambda x: x[:, 63:66],
+        a_get_g=lambda x: x[0, -3:],
+        b_get_g=lambda x: x[0, -7:-4],
+    )
+    exit(0)
 
     _training_set, _test_set = _full_dataset.split(
         shuffle=True,
@@ -893,4 +952,5 @@ if __name__ == '__main__':
         test_set=_test_set,
         local_dir='../out/pp_yumi_twin_ae_test_z15',
         net_class=SimpleAutoencoder,
+        new_params_each_cycle=False,
     )
