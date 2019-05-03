@@ -9,11 +9,13 @@ from gym.utils.transformations import render_pose
 from gym.agents.yumi import YumiConstrainedAgent
 from gym.utils import transformations as tf
 
+import _thesis_modules
 from playground.twin_vae import TwinVAE, TwinDataset, SimpleAutoencoder
 from thesis_tools.utils import wait_for_key
 
 
-KEYBOARD_CTRL = False
+YUMI_KEYBOARD_CTRL = False
+HAND_KEYBOARD_CTRL = False
 
 
 def _flatten_obs(obs_dict):
@@ -29,6 +31,7 @@ def _action_thread(yumi_action, hand_action):
             return None
 
     a = yumi_action
+    b = hand_action
     while True:
         key = wait_for_key()
         i = safe_int(key)
@@ -52,6 +55,29 @@ def _action_thread(yumi_action, hand_action):
         elif key == 'D':
             a[2] = -0.2
 
+        arm_pos_ctrl = b[-7:-4]
+        hand_ctrl = b[2:-7]
+        hand_ctrl[[0, 3]] = 1.0
+        hand_ctrl[[6, 9]] = -1.0
+        if key == 'c':
+            hand_ctrl[:] = 1.0
+            hand_ctrl[13:] = (0.1, 0.5, 1., -1., 0)
+        elif key == 'o':
+            hand_ctrl[:] = -1.0
+            hand_ctrl[13:] = (-1., -0.5, 1., -1., 0)
+        elif key == 'w':
+            arm_pos_ctrl[0] = -1.
+        elif key == 's':
+            arm_pos_ctrl[0] = 1.
+        elif key == 'a':
+            arm_pos_ctrl[1] = -1.
+        elif key == 'd':
+            arm_pos_ctrl[1] = 1.
+        elif key == 'z':
+            arm_pos_ctrl[2] = 1.
+        elif key == 'x':
+            arm_pos_ctrl[2] = -1.
+
 
 def _imitate_hand_with_model(model: TwinVAE, hand_norm_obs: np.ndarray, yumi_env, yumi_scaler, n=10) -> np.ndarray:
 
@@ -60,6 +86,7 @@ def _imitate_hand_with_model(model: TwinVAE, hand_norm_obs: np.ndarray, yumi_env
     if not isinstance(yumi_env, YumiConstrainedEnv):
         yumi_env = yumi_env.unwrapped # type: YumiConstrainedEnv
 
+    np_random = yumi_env.np_random
     prev_state = copy.deepcopy(yumi_env.sim.get_state())
     best_u = None
     best_sim_loss = np.inf
@@ -68,8 +95,8 @@ def _imitate_hand_with_model(model: TwinVAE, hand_norm_obs: np.ndarray, yumi_env
     yumi_env.sim_env.viewer = None
 
     for _ in range(n):
-        u = np.random.uniform(-1, 1, size=4) * 0.1
-        u[0] = np.sign(u[0])
+        u = np_random.uniform(-1, 1, size=4) * 0.1
+        u[0] = np_random.choice([-1, -.5, .5, 1.])
         yumi_obs = yumi_env.step(u.copy())[0]
         yumi_obs = yumi_scaler.transform(_flatten_obs(yumi_obs)[None], copy=True)[0]
         sim_loss = model.compute_obs_sim_loss(yumi_obs, hand_norm_obs).mean()
@@ -100,20 +127,26 @@ def main():
         object_id='box'
     )
 
+    a_env.seed(43)
+    b_env.seed(43)
+
     yumi_action = np.zeros(a_env.action_space.shape)
     hand_action = np.zeros(b_env.action_space.shape)
 
-    if KEYBOARD_CTRL:
+    if YUMI_KEYBOARD_CTRL or HAND_KEYBOARD_CTRL:
         p = Thread(target=_action_thread, args=(yumi_action, hand_action))
         p.start()
 
-    dataset = TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl')
+    dataset = TwinDataset.merge(
+        TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl'),
+        TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
+    )
     dataset.normalize()
 
     from gym.agents.shadow_hand import HandPickAndPlaceAgent
     hand_agent = HandPickAndPlaceAgent(b_env)
 
-    model = TwinVAE.load('../out/pp_yumi_twin_ae_test_z15/checkpoints/model_c49.pt',
+    model = TwinVAE.load('../out/pp_and_reach_yumi_twin_ae_test_z15/checkpoints/model_c49.pt',
                          net_class=SimpleAutoencoder)
     # model.to('cuda')
 
@@ -155,20 +188,27 @@ def main():
         a_env.render()
         b_env.render()
 
-        if not KEYBOARD_CTRL:
+        if not YUMI_KEYBOARD_CTRL:
             yumi_action = _imitate_hand_with_model(model, b_obs, a_env, dataset.a_scaler, n=5)
 
-        if KEYBOARD_CTRL or i % 5 == 0:
-            hand_action = hand_agent.predict(b_obs_orig)
+        if HAND_KEYBOARD_CTRL:
             b_obs = b_env.step(hand_action)[0]
         else:
-            b_obs = b_obs_orig
+            if i % 5 == 0:
+                hand_action = hand_agent.predict(b_obs_orig)
+                b_obs = b_env.step(hand_action)[0]
+            else:
+                b_obs = b_obs_orig
 
         a_obs = a_env.step(yumi_action)[0]
         done = False
 
-        if KEYBOARD_CTRL and i % 5 == 0:
+        if YUMI_KEYBOARD_CTRL and i % 5 == 0:
             yumi_action[1:] = 0.
+
+        if HAND_KEYBOARD_CTRL and i % 2 == 0:
+            arm_pos_ctrl = hand_action[-7:-4]
+            arm_pos_ctrl[:] = 0.
 
 
 if __name__ == '__main__':

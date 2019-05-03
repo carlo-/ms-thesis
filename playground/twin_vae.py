@@ -1,5 +1,6 @@
 import os
 import pickle
+import json
 from typing import Callable
 from copy import deepcopy
 
@@ -402,6 +403,16 @@ class TwinDataset(Dataset):
             TwinDataset(a_test, b_test, copy=copy),
         )
 
+    @staticmethod
+    def merge(dataset1, dataset2):
+        assert isinstance(dataset1, TwinDataset)
+        assert isinstance(dataset2, TwinDataset)
+        return TwinDataset(
+            a_episodes=(dataset1.a_episodes + dataset2.a_episodes),
+            b_episodes=(dataset1.b_episodes + dataset2.b_episodes),
+            copy=True,
+        )
+
     def save(self, file_path: str, with_aligned_states=False):
         obj = dict(a_episodes=self.a_episodes, b_episodes=self.b_episodes)
         if with_aligned_states:
@@ -777,6 +788,136 @@ def _generate_twin_episodes_yumi(n=1_000, max_ep_steps=200, seed=42, render=Fals
     return a_episodes, b_episodes
 
 
+def _generate_twin_episodes_yumi_reach(n=1_000, max_ep_steps=80, seed=42, render=False):
+
+    import gym
+    from gym.envs.yumi import YumiConstrainedEnv
+    from gym.envs.robotics import HandPickAndPlaceEnv
+    from gym.agents.yumi import YumiConstrainedAgent
+    from gym.agents.shadow_hand import HandPickAndPlaceAgent
+    from gym.utils import transformations as tf
+
+    def flatten_obs(obs_dict):
+        return np.r_[obs_dict['observation'], obs_dict['desired_goal']]
+
+    a_env = gym.make(
+        'YumiConstrained-v1'
+    ).unwrapped # type: YumiConstrainedEnv
+
+    b_env = gym.make(
+        'HandPickAndPlace-v0',
+        ignore_rotation_ctrl=True,
+        ignore_target_rotation=True,
+        success_on_grasp_only=False,
+        randomize_initial_arm_pos=True,
+        randomize_initial_object_pos=True,
+        object_id='box'
+    ).unwrapped # type: HandPickAndPlaceEnv
+
+    a_env.seed(seed)
+    b_env.seed(seed)
+
+    a_episodes = []
+    b_episodes = []
+    prog = tqdm(total=n, desc='Recorded episodes')
+
+    a_table_tf = a_env.get_table_surface_pose()
+    b_table_tf = b_env.get_table_surface_pose()
+
+    def hand_action_open(should_open, env):
+        u = np.zeros(env.action_space.shape)
+        hand_ctrl = u[2:-7]
+
+        hand_ctrl[[0, 3]] = 1.0
+        hand_ctrl[[6, 9]] = -1.0
+
+        if should_open:
+            hand_ctrl[:] = -1.0
+            hand_ctrl[13:] = (-1., -0.5, 1., -1., 0)
+        else:
+            hand_ctrl[:] = 1.0
+            hand_ctrl[13:] = (0.1, 0.5, 1., -1., 0)
+
+        return u
+
+    def yumi_action_open(should_open, env):
+        u = np.zeros(env.action_space.shape)
+        u[0] = 1. if should_open else -1.
+        return u
+
+    def hand_action_reach(obs, env):
+        u = np.zeros(env.action_space.shape)
+        arm_pos_ctrl = u[-7:-4]
+        d = obs['desired_goal'][:3] - env.unwrapped._get_grasp_center_pose()[:3]
+        arm_pos_ctrl[:] = d * 2.0
+        return u
+
+    def yumi_action_reach(obs, env):
+        u = np.zeros(env.action_space.shape)
+        arm_pos_ctrl = u[1:4]
+        d = obs['desired_goal'][:3] - env.unwrapped.get_grasp_center_pos()
+        arm_pos_ctrl[:] = d * 2.0
+        return u
+
+    while len(a_episodes) < n:
+
+        a_states = []
+        b_states = []
+
+        a_env.reset()
+        b_env.reset()
+
+        t_to_goal = tf.get_tf(np.r_[a_env.goal, 1., 0., 0., 0.], a_table_tf)
+        b_goal_pose = tf.apply_tf(t_to_goal, b_table_tf)
+
+        b_env.goal = np.r_[b_goal_pose[:3], np.zeros(4)]
+
+        t_to_obj = tf.get_tf(a_env.get_object_pose(), a_table_tf)
+        b_obj_pose = tf.apply_tf(t_to_obj, b_table_tf)
+
+        object_pos = b_env.sim.data.get_joint_qpos('object:joint').copy()
+        object_pos[:2] = b_obj_pose[:2]
+        b_env.sim.data.set_joint_qpos('object:joint', object_pos)
+        b_env.sim.forward()
+
+        a_obs = a_env._get_obs()
+        b_obs = b_env._get_obs()
+
+        a_states.append(flatten_obs(a_obs))
+        b_states.append(flatten_obs(b_obs))
+
+        for i in range(max_ep_steps):
+
+            act = hand_action_open((i // 20) % 2 == 0, b_env)
+            b_action = act + hand_action_reach(b_obs, b_env)
+
+            act = yumi_action_open((i // 20) % 2 == 0, a_env)
+            a_action = act + yumi_action_reach(a_obs, a_env)
+
+            a_action += np.random.uniform(-1, 1) * 0.01
+            b_action += np.random.uniform(-1, 1) * 0.01
+
+            a_obs, a_rew, a_done, a_info = a_env.step(a_action)
+            b_obs, b_rew, b_done, b_info = b_env.step(b_action)
+
+            a_states.append(flatten_obs(a_obs))
+            b_states.append(flatten_obs(b_obs))
+
+            if render:
+                a_env.render()
+                b_env.render()
+
+            if a_done or b_done:
+                break
+
+        prog.update()
+        a_episodes.append(np.array(a_states))
+        b_episodes.append(np.array(b_states))
+
+    prog.close()
+    return a_episodes, b_episodes
+
+
 def _generate_twin_dataset(file_path, n=1_000, max_ep_steps=200, seed=42, render=False, generator=None):
     generator = generator or _generate_twin_episodes
     a_episodes, b_episodes = generator(n=n, max_ep_steps=max_ep_steps, seed=seed, render=render)
@@ -907,9 +1048,14 @@ if __name__ == '__main__':
     # _generate_twin_dataset(file_path='../out/pp_twin_dataset_10k.pkl', n=10_000, render=False)
     # _generate_twin_dataset(file_path='../out/pp_yumi_twin_dataset_3k.pkl', n=3_000, render=False,
     #                        generator=_generate_twin_episodes_yumi, max_ep_steps=110)
+    # _generate_twin_dataset(file_path='../out/pp_reach_yumi_twin_dataset_2k.pkl', n=2_000, render=False,
+    #                        generator=_generate_twin_episodes_yumi_reach, max_ep_steps=80)
+    # exit(0)
 
     # _full_dataset = TwinDataset.load('../out/pp_twin_dataset_10k.pkl')
     _full_dataset = TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl')
+    _secondary_ds = TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
+    _full_dataset = TwinDataset.merge(_full_dataset, _secondary_ds)
     _full_dataset.normalize()
 
     # _test_dwt_on_dataset(_full_dataset)
@@ -929,16 +1075,16 @@ if __name__ == '__main__':
     #     b_get_g=lambda x: x[0, -7:-4],
     # )
 
-    _test_sim_loss(
-        _full_dataset,
-        model=TwinVAE.load('../out/pp_yumi_twin_ae_test_z15/checkpoints/model_c49.pt',
-                           net_class=SimpleAutoencoder),
-        a_get_ag=lambda x: x[:, 18:21],
-        b_get_ag=lambda x: x[:, 63:66],
-        a_get_g=lambda x: x[0, -3:],
-        b_get_g=lambda x: x[0, -7:-4],
-    )
-    exit(0)
+    # _test_sim_loss(
+    #     _full_dataset,
+    #     model=TwinVAE.load('../out/pp_and_reach_yumi_twin_ae_test_z15/checkpoints/model_c49.pt',
+    #                        net_class=SimpleAutoencoder),
+    #     a_get_ag=lambda x: x[:, 18:21],
+    #     b_get_ag=lambda x: x[:, 63:66],
+    #     a_get_g=lambda x: x[0, -3:],
+    #     b_get_g=lambda x: x[0, -7:-4],
+    # )
+    # exit(0)
 
     _training_set, _test_set = _full_dataset.split(
         shuffle=True,
@@ -950,7 +1096,7 @@ if __name__ == '__main__':
     train(
         training_set=_training_set,
         test_set=_test_set,
-        local_dir='../out/pp_yumi_twin_ae_test_z15',
+        local_dir='../out/pp_and_reach_yumi_twin_ae_test_z15',
         net_class=SimpleAutoencoder,
         new_params_each_cycle=False,
     )
