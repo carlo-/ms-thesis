@@ -84,14 +84,18 @@ class VAE(AutoencoderBase):
         super(VAE, self).__init__(input_size, **kwargs)
 
         self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc21 = nn.Linear(hidden_size, z_size)
-        self.fc22 = nn.Linear(hidden_size, z_size)
-        self.fc3 = nn.Linear(z_size, hidden_size)
-        self.fc4 = nn.Linear(hidden_size, input_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc31 = nn.Linear(hidden_size, z_size)
+        self.fc32 = nn.Linear(hidden_size, z_size)
+
+        self.fc4 = nn.Linear(z_size, hidden_size)
+        self.fc5 = nn.Linear(hidden_size, hidden_size)
+        self.fc6 = nn.Linear(hidden_size, input_size)
 
     def _encode(self, x):
         h1 = F.relu(self.fc1(x))
-        return self.fc21(h1), self.fc22(h1)
+        h2 = F.relu(self.fc2(h1))
+        return self.fc31(h2), self.fc32(h2)
 
     def _reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -107,8 +111,9 @@ class VAE(AutoencoderBase):
             return mu
 
     def decode(self, z):
-        h3 = F.relu(self.fc3(z))
-        return torch.sigmoid(self.fc4(h3))
+        h4 = F.relu(self.fc4(z))
+        h5 = F.relu(self.fc5(h4))
+        return torch.sigmoid(self.fc6(h5))
 
     def forward(self, x):
         mu, logvar = self._encode(x.view(-1, self.input_size))
@@ -119,13 +124,14 @@ class VAE(AutoencoderBase):
     # Reconstruction + KL divergence losses summed over all elements and batch
     def loss_function(self, x, recon_x, mu, logvar):
         bce = F.binary_cross_entropy(recon_x, x.view(-1, self.input_size), reduction='sum')
-        kdl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()).item()
-        return bce + kdl
+        kdl = -torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) * 0.5
+        tot = bce + kdl
+        return tot, bce, kdl
 
 
 class SimpleAutoencoder(AutoencoderBase):
 
-    def __init__(self, input_size: int, hidden_size: int, z_size: int, **kwargs):
+    def __init__(self, input_size: int, hidden_size: int, z_size: int, use_kdl_loss: bool = False, **kwargs):
         super(SimpleAutoencoder, self).__init__(input_size, **kwargs)
 
         self.encoder = nn.Sequential(
@@ -146,6 +152,7 @@ class SimpleAutoencoder(AutoencoderBase):
         )
 
         self._loss_fn = nn.MSELoss(reduction='sum')
+        self.use_kdl_loss = use_kdl_loss
 
     def encode(self, x, **kwargs):
         return self.encoder(x)
@@ -158,8 +165,16 @@ class SimpleAutoencoder(AutoencoderBase):
         recon = self.decode(z)
         return z, recon
 
-    def loss_function(self, x, recon_x):
-        return self._loss_fn(recon_x, x.view(-1, self.input_size))
+    def loss_function(self, x, recon_x, z=None, logvar=None):
+        mse = self._loss_fn(recon_x, x.view(-1, self.input_size))
+        kdl = np.zeros(1)
+        if self.use_kdl_loss:
+            # kdl = (z.pow(2) + logvar.exp() - 1 - logvar).sum() * 0.5
+            kdl = ((z - 1.0)**2.0).sum()
+            tot = mse + kdl
+        else:
+            tot = mse
+        return tot, mse, kdl
 
 
 class TwinVAE:
@@ -218,20 +233,20 @@ class TwinVAE:
         b_z = self.b_vae.encode(b_data, **encode_kwargs)
         return self.sim_loss_no_red(a_z, b_z)
 
-    def compute_losses(self, a_data, b_data):
+    def compute_losses(self, a_data, b_data, fixed_logvar=None):
 
         if isinstance(self.a_vae, VAE):
             a_z, a_recon_x, a_mu, a_logvar = self.a_vae(a_data)
-            a_loss = self.a_loss(a_data, a_recon_x, a_mu, a_logvar)
+            a_loss, a_recon_l, a_kdl_l = self.a_loss(a_data, a_recon_x, a_mu, a_logvar)
 
             b_z, b_recon_x, b_mu, b_logvar = self.b_vae(b_data)
-            b_loss = self.b_loss(b_data, b_recon_x, b_mu, b_logvar)
+            b_loss, b_recon_l, b_kdl_l = self.b_loss(b_data, b_recon_x, b_mu, b_logvar)
         else:
             a_z, a_recon_x = self.a_vae(a_data)
-            a_loss = self.a_loss(a_data, a_recon_x)
+            a_loss, a_recon_l, a_kdl_l = self.a_loss(a_data, a_recon_x, a_z, fixed_logvar)
 
             b_z, b_recon_x = self.b_vae(b_data)
-            b_loss = self.b_loss(b_data, b_recon_x)
+            b_loss, b_recon_l, b_kdl_l = self.b_loss(b_data, b_recon_x, b_z, fixed_logvar)
 
         sim_loss = self.sim_loss(a_z, b_z)
 
@@ -242,7 +257,7 @@ class TwinVAE:
 
         total_loss = a_loss + b_loss + sim_loss
 
-        return total_loss, a_loss, b_loss, sim_loss
+        return total_loss, a_loss, b_loss, sim_loss, a_recon_l, a_kdl_l, b_recon_l, b_kdl_l
 
     def compute_obs_sim_loss(self, a_obs, b_obs):
         with torch.no_grad():
@@ -250,6 +265,20 @@ class TwinVAE:
             b = torch.tensor(b_obs[None], dtype=torch.float32, device=self.device)
             sim_loss = self.compute_elementwise_sim_loss(a, b, reparameterize=False)[0]
         return sim_loss.cpu().numpy()
+
+    def cross_decode_a_to_b(self, a_obs):
+        with torch.no_grad():
+            a = torch.tensor(a_obs[None], dtype=torch.float32, device=self.device)
+            z = self.a_vae.encode(a, reparameterize=False)
+            recon_b = self.b_vae.decode(z)[0]
+        return recon_b.cpu().numpy()
+
+    def cross_decode_b_to_a(self, b_obs):
+        with torch.no_grad():
+            b = torch.tensor(b_obs[None], dtype=torch.float32, device=self.device)
+            z = self.b_vae.encode(b, reparameterize=False)
+            recon_a = self.a_vae.decode(z)[0]
+        return recon_a.cpu().numpy()
 
     def to(self, device):
         if isinstance(device, str):
@@ -278,12 +307,16 @@ class TwinVAE:
 
 
 def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, device, epoch: int, log_interval=1,
-                   writer: SummaryWriter = None, global_step: int = None):
+                   writer: SummaryWriter = None, global_step: int = None, fixed_logvar=None):
     model.train()
     avg_tot_loss = 0.0
     avg_sim_loss = 0.0
     avg_a_loss = 0.0
     avg_b_loss = 0.0
+    avg_a_kdl_loss = 0.0
+    avg_b_kdl_loss = 0.0
+    avg_a_recon_loss = 0.0
+    avg_b_recon_loss = 0.0
     ds_size = len(data_loader.dataset)
 
     for batch_idx, (a_data, b_data) in enumerate(data_loader):
@@ -293,13 +326,17 @@ def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, devi
         b_data = b_data.to(device)
 
         optimizer.zero_grad()
-        losses = model.compute_losses(a_data, b_data)
-        total_loss, a_loss, b_loss, sim_loss = losses
+        losses = model.compute_losses(a_data, b_data, fixed_logvar)
+        total_loss, a_loss, b_loss, sim_loss, a_recon_l, a_kdl_l, b_recon_l, b_kdl_l = losses
 
         avg_tot_loss += total_loss.item()
         avg_a_loss += a_loss.item()
         avg_b_loss += b_loss.item()
         avg_sim_loss += sim_loss.item()
+        avg_a_kdl_loss += a_kdl_l.item()
+        avg_b_kdl_loss += b_kdl_l.item()
+        avg_a_recon_loss += a_recon_l.item()
+        avg_b_recon_loss += b_recon_l.item()
 
         total_loss.backward()
         optimizer.step(None)
@@ -314,6 +351,10 @@ def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, devi
     avg_a_loss /= ds_size
     avg_b_loss /= ds_size
     avg_sim_loss /= ds_size
+    avg_a_kdl_loss /= ds_size
+    avg_b_kdl_loss /= ds_size
+    avg_a_recon_loss /= ds_size
+    avg_b_recon_loss /= ds_size
     print('====> Epoch: {} Average loss: {:.4f} (sim: {:.6f}, a: {:.6f}, b: {:.6f})'.format(
         epoch, avg_tot_loss, avg_sim_loss, avg_a_loss, avg_b_loss
     ))
@@ -323,14 +364,23 @@ def _training_step(model: TwinVAE, optimizer: optim.Optimizer, data_loader, devi
         writer.add_scalar(tag='training_loss/avg_a_loss', scalar_value=avg_a_loss, global_step=global_step)
         writer.add_scalar(tag='training_loss/avg_b_loss', scalar_value=avg_b_loss, global_step=global_step)
         writer.add_scalar(tag='training_loss/avg_sim_loss', scalar_value=avg_sim_loss, global_step=global_step)
+        writer.add_scalar(tag='training_loss/avg_a_kdl_loss', scalar_value=avg_a_kdl_loss, global_step=global_step)
+        writer.add_scalar(tag='training_loss/avg_b_kdl_loss', scalar_value=avg_b_kdl_loss, global_step=global_step)
+        writer.add_scalar(tag='training_loss/avg_a_recon_loss', scalar_value=avg_a_recon_loss, global_step=global_step)
+        writer.add_scalar(tag='training_loss/avg_b_recon_loss', scalar_value=avg_b_recon_loss, global_step=global_step)
 
 
-def _evaluation_step(model: TwinVAE, data_loader, device, writer: SummaryWriter = None, global_step: int = None):
+def _evaluation_step(model: TwinVAE, data_loader, device, writer: SummaryWriter = None, global_step: int = None,
+                     fixed_logvar=None):
     model.eval()
     avg_tot_loss = 0.0
     avg_sim_loss = 0.0
     avg_a_loss = 0.0
     avg_b_loss = 0.0
+    avg_a_kdl_loss = 0.0
+    avg_b_kdl_loss = 0.0
+    avg_a_recon_loss = 0.0
+    avg_b_recon_loss = 0.0
     ds_size = len(data_loader.dataset)
 
     with torch.no_grad():
@@ -339,18 +389,26 @@ def _evaluation_step(model: TwinVAE, data_loader, device, writer: SummaryWriter 
             a_data = a_data.to(device)
             b_data = b_data.to(device)
 
-            losses = model.compute_losses(a_data, b_data)
-            total_loss, a_loss, b_loss, sim_loss = losses
+            losses = model.compute_losses(a_data, b_data, fixed_logvar)
+            total_loss, a_loss, b_loss, sim_loss, a_recon_l, a_kdl_l, b_recon_l, b_kdl_l = losses
 
             avg_tot_loss += total_loss.item()
             avg_a_loss += a_loss.item()
             avg_b_loss += b_loss.item()
             avg_sim_loss += sim_loss.item()
+            avg_a_kdl_loss += a_kdl_l.item()
+            avg_b_kdl_loss += b_kdl_l.item()
+            avg_a_recon_loss += a_recon_l.item()
+            avg_b_recon_loss += b_recon_l.item()
 
     avg_tot_loss /= ds_size
     avg_a_loss /= ds_size
     avg_b_loss /= ds_size
     avg_sim_loss /= ds_size
+    avg_a_kdl_loss /= ds_size
+    avg_b_kdl_loss /= ds_size
+    avg_a_recon_loss /= ds_size
+    avg_b_recon_loss /= ds_size
     print('====> Test average loss: {:.4f} (sim: {:.6f}, a: {:.6f}, b: {:.6f})'.format(
         avg_tot_loss, avg_sim_loss, avg_a_loss, avg_b_loss
     ))
@@ -360,6 +418,10 @@ def _evaluation_step(model: TwinVAE, data_loader, device, writer: SummaryWriter 
         writer.add_scalar(tag='test_loss/avg_a_loss', scalar_value=avg_a_loss, global_step=global_step)
         writer.add_scalar(tag='test_loss/avg_b_loss', scalar_value=avg_b_loss, global_step=global_step)
         writer.add_scalar(tag='test_loss/avg_sim_loss', scalar_value=avg_sim_loss, global_step=global_step)
+        writer.add_scalar(tag='test_loss/avg_a_kdl_loss', scalar_value=avg_a_kdl_loss, global_step=global_step)
+        writer.add_scalar(tag='test_loss/avg_b_kdl_loss', scalar_value=avg_b_kdl_loss, global_step=global_step)
+        writer.add_scalar(tag='test_loss/avg_a_recon_loss', scalar_value=avg_a_recon_loss, global_step=global_step)
+        writer.add_scalar(tag='test_loss/avg_b_recon_loss', scalar_value=avg_b_recon_loss, global_step=global_step)
 
 
 class TwinDataset(Dataset):
@@ -516,7 +578,8 @@ class TwinDataset(Dataset):
 
 
 def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42, learning_rate=1e-4,
-          n_workers=2, n_cycles=50, n_epochs=3, batch_size=128, net_class=None, new_params_each_cycle=False):
+          n_workers=1, n_cycles=50, n_epochs=3, batch_size=128, net_class=None, new_params_each_cycle=False,
+          ae_kwargs=None, z_logvar=0.0, z_size=15):
 
     checkpoints_dir = local_dir + '/checkpoints'
     os.makedirs(checkpoints_dir, exist_ok=True)
@@ -524,10 +587,11 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
 
     writer = SummaryWriter(log_dir=local_dir)
 
+    ae_kwargs = ae_kwargs or dict()
     model_config = dict(
-        a_spec=dict(input_size=training_set.a_item_size, hidden_size=60),
-        b_spec=dict(input_size=training_set.b_item_size, hidden_size=60),
-        z_size=15,
+        a_spec=dict(input_size=training_set.a_item_size, hidden_size=60, **ae_kwargs),
+        b_spec=dict(input_size=training_set.b_item_size, hidden_size=60, **ae_kwargs),
+        z_size=z_size,
         net_class=net_class,
         normalize_losses=False,
     )
@@ -558,6 +622,11 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
     training_data_loader = DataLoader(dataset=training_set, num_workers=n_workers, batch_size=batch_size, shuffle=True)
     test_data_loader = DataLoader(dataset=test_set, num_workers=n_workers, batch_size=batch_size, shuffle=False)
 
+    fixed_logvar = None
+    if z_logvar is not None:
+        with torch.no_grad():
+            fixed_logvar = torch.tensor(z_logvar, dtype=torch.float32, device=device)
+
     global_step = 0
     for cycle in range(n_cycles):
 
@@ -571,10 +640,11 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
             print('\nTraining...')
             writer.add_scalar(tag='progress/epoch', scalar_value=epoch, global_step=global_step)
             _training_step(model, optimizer, training_data_loader, device, epoch, log_interval=100,
-                           writer=writer, global_step=global_step)
+                           writer=writer, global_step=global_step, fixed_logvar=fixed_logvar)
 
             print('\nEvaluating...')
-            _evaluation_step(model, test_data_loader, device, writer=writer, global_step=global_step)
+            _evaluation_step(model, test_data_loader, device, writer=writer, global_step=global_step,
+                             fixed_logvar=fixed_logvar)
 
         print('\nSaving checkpoint...')
         model.save(f'{checkpoints_dir}/model_c{cycle}.pt')
@@ -918,6 +988,102 @@ def _generate_twin_episodes_yumi_reach(n=1_000, max_ep_steps=80, seed=42, render
     return a_episodes, b_episodes
 
 
+def _generate_twin_episodes_yumi_and_fetch(n=1_000, max_ep_steps=200, seed=42, render=False):
+
+    import gym
+    from gym.envs.yumi import YumiConstrainedEnv
+    from gym.envs.robotics import FetchPickAndPlaceEnv
+    from gym.agents.yumi import YumiConstrainedAgent
+    from gym.agents.fetch import FetchPickAndPlaceAgent
+    from gym.utils import transformations as tf
+
+    def flatten_obs(obs_dict):
+        return np.r_[obs_dict['observation'], obs_dict['desired_goal']]
+
+    a_env = gym.make(
+        'YumiConstrained-v1'
+    ).unwrapped # type: YumiConstrainedEnv
+
+    b_env = gym.make(
+        'FetchPickAndPlace-v1'
+    ).unwrapped  # type: FetchPickAndPlaceEnv
+
+    a_env.seed(seed)
+    b_env.seed(seed)
+
+    a_agent = YumiConstrainedAgent(a_env)
+    b_agent = FetchPickAndPlaceAgent(b_env)
+
+    a_episodes = []
+    b_episodes = []
+    prog = tqdm(total=n, desc='Recorded episodes')
+
+    a_table_tf = a_env.get_table_surface_pose()
+    b_table_tf = gym.make('HandPickAndPlace-v0').unwrapped.get_table_surface_pose()
+
+    while len(a_episodes) < n:
+
+        a_states = []
+        b_states = []
+
+        a_env.reset()
+        b_env.reset()
+
+        t_to_goal = tf.get_tf(np.r_[a_env.goal, 1., 0., 0., 0.], a_table_tf)
+        b_goal_pose = tf.apply_tf(t_to_goal, b_table_tf)
+
+        b_env.goal = b_goal_pose[:3]
+
+        t_to_obj = tf.get_tf(a_env.get_object_pose(), a_table_tf)
+        b_obj_pose = tf.apply_tf(t_to_obj, b_table_tf)
+
+        object_pos = b_env.sim.data.get_joint_qpos('object0:joint').copy()
+        object_pos[:2] = b_obj_pose[:2]
+        b_env.sim.data.set_joint_qpos('object0:joint', object_pos)
+        b_env.sim.forward()
+
+        a_agent.reset()
+        b_agent.reset()
+
+        a_obs = a_env._get_obs()
+        b_obs = b_env._get_obs()
+
+        a_states.append(flatten_obs(a_obs))
+        b_states.append(flatten_obs(b_obs))
+
+        success = False
+
+        for _ in range(max_ep_steps):
+
+            a_action = a_agent.predict(a_obs)
+            b_action = b_agent.predict(b_obs)
+
+            a_obs, a_rew, a_done, a_info = a_env.step(a_action)
+            b_obs, b_rew, b_done, b_info = b_env.step(b_action)
+
+            a_states.append(flatten_obs(a_obs))
+            b_states.append(flatten_obs(b_obs))
+
+            if render:
+                a_env.render()
+                b_env.render()
+
+            success = a_info['is_success'] == 1.0 and b_info['is_success'] == 1.0
+            if success:
+                break
+
+            if a_done or b_done:
+                break
+
+        if success:
+            prog.update()
+            a_episodes.append(np.array(a_states))
+            b_episodes.append(np.array(b_states))
+
+    prog.close()
+    return a_episodes, b_episodes
+
+
 def _generate_twin_dataset(file_path, n=1_000, max_ep_steps=200, seed=42, render=False, generator=None):
     generator = generator or _generate_twin_episodes
     a_episodes, b_episodes = generator(n=n, max_ep_steps=max_ep_steps, seed=seed, render=render)
@@ -1050,12 +1216,15 @@ if __name__ == '__main__':
     #                        generator=_generate_twin_episodes_yumi, max_ep_steps=110)
     # _generate_twin_dataset(file_path='../out/pp_reach_yumi_twin_dataset_2k.pkl', n=2_000, render=False,
     #                        generator=_generate_twin_episodes_yumi_reach, max_ep_steps=80)
+    # _generate_twin_dataset(file_path='../out/pp_yumi_fetch_twin_dataset_5k.pkl', n=5_000, render=False,
+    #                        generator=_generate_twin_episodes_yumi_and_fetch, max_ep_steps=80)
     # exit(0)
 
     # _full_dataset = TwinDataset.load('../out/pp_twin_dataset_10k.pkl')
-    _full_dataset = TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl')
-    _secondary_ds = TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
-    _full_dataset = TwinDataset.merge(_full_dataset, _secondary_ds)
+    _full_dataset = TwinDataset.load('../out/pp_yumi_fetch_twin_dataset_5k.pkl')
+    # _full_dataset = TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl')
+    # _secondary_ds = TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
+    # _full_dataset = TwinDataset.merge(_full_dataset, _secondary_ds)
     _full_dataset.normalize()
 
     # _test_dwt_on_dataset(_full_dataset)
@@ -1096,7 +1265,8 @@ if __name__ == '__main__':
     train(
         training_set=_training_set,
         test_set=_test_set,
-        local_dir='../out/pp_and_reach_yumi_twin_ae_test_z15',
+        local_dir='../out/twin_yumi_fetch_ae_resets',
         net_class=SimpleAutoencoder,
-        new_params_each_cycle=False,
+        new_params_each_cycle=True,
+        n_epochs=20,
     )
