@@ -179,7 +179,8 @@ class SimpleAutoencoder(AutoencoderBase):
 
 class TwinVAE:
 
-    def __init__(self, a_spec: dict, b_spec: dict, z_size: int, net_class=None, normalize_losses=False):
+    def __init__(self, a_spec: dict, b_spec: dict, z_size: int, net_class=None,
+                 normalize_losses=False, loss_weights=None):
         self.a_spec = dict(a_spec)
         self.b_spec = dict(b_spec)
         self.z_size = z_size
@@ -193,6 +194,7 @@ class TwinVAE:
         self.sim_loss = nn.MSELoss(reduction='sum')
         self.sim_loss_no_red = nn.MSELoss(reduction='none')
         self.normalize_losses = normalize_losses
+        self.loss_weights = loss_weights
         self._device = torch.device('cpu')
 
     @property
@@ -254,6 +256,11 @@ class TwinVAE:
             a_loss /= self.a_vae.input_size
             b_loss /= self.b_vae.input_size
             sim_loss /= self.z_size
+
+        if self.loss_weights is not None:
+            a_loss *= self.loss_weights['a']
+            b_loss *= self.loss_weights['b']
+            sim_loss *= self.loss_weights['sim']
 
         total_loss = a_loss + b_loss + sim_loss
 
@@ -424,6 +431,99 @@ def _evaluation_step(model: TwinVAE, data_loader, device, writer: SummaryWriter 
         writer.add_scalar(tag='test_loss/avg_b_recon_loss', scalar_value=avg_b_recon_loss, global_step=global_step)
 
 
+def _visual_evaluation_step(model: TwinVAE, dataset, device, writer: SummaryWriter = None, global_step: int = None,
+                            cycle_i=0, *, a_get_ag, a_get_g, b_get_ag, b_get_g):
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    import matplotlib.cm as cm
+
+    model.eval()
+    num_examples = 3
+    np_random = np.random.RandomState(120)
+
+    done_idx = []
+
+    fig = Figure(figsize=(8, 4*num_examples), dpi=100)
+    fig.suptitle(f'Cycle {cycle_i}')
+    canvas = FigureCanvasAgg(fig)
+
+    while len(done_idx) < num_examples:
+        i = len(done_idx)
+        ep_i = np_random.choice(len(dataset.a_episodes), size=1).item()
+        if ep_i in done_idx:
+            continue
+
+        a_ep = deepcopy(dataset.a_episodes[ep_i])
+        b_ep = deepcopy(dataset.b_episodes[ep_i])
+
+        a_ep_s = dataset.a_scaler.inverse_transform(a_ep, copy=True)
+        b_ep_s = dataset.b_scaler.inverse_transform(b_ep, copy=True)
+
+        goal_d = np.linalg.norm(a_get_ag(a_ep_s) - a_get_g(a_ep_s), axis=1)
+        if np.abs(goal_d[0] - goal_d[-1]) < 0.1:
+            # uninteresting episode
+            continue
+
+        done_idx.append(ep_i)
+
+        with torch.no_grad():
+            a_ep_t = torch.tensor(a_ep, dtype=torch.float32, device=device)
+            b_ep_t = torch.tensor(b_ep, dtype=torch.float32, device=device)
+            n, m = a_ep_t.shape[0], b_ep_t.shape[0]
+            res = torch.zeros((n, m), dtype=torch.float32, device=device)
+            for j in range(n):
+                # foo = np.linalg.norm(a_ep_s[j, 18:21] - a_ep_s[j, -3:])
+                # bar = np.linalg.norm(b_ep_s[:, 63:66] - b_ep_s[0, -7:-4], axis=1)
+                # res[j] = torch.tensor((foo - bar)**2.0, dtype=torch.float32, device=device)
+                sim_loss = model.compute_elementwise_sim_loss(a_ep_t[j].repeat(m, 1), b_ep_t, reparameterize=False)
+                res[j] = sim_loss.mean(dim=1)
+            res = res.cpu().numpy()
+
+        sim = np.diag(res)
+        cost, path = dynamic_time_warping_c(res)
+        a_dtw_s = a_ep_s[path[:, 0]]
+        b_dtw_s = b_ep_s[path[:, 1]]
+        sim_dtw = res[path[:, 0], path[:, 1]]
+
+        a_ag = a_get_ag(a_ep_s)
+        a_g = a_get_g(a_ep_s)
+        b_ag = b_get_ag(b_ep_s)
+        b_g = b_get_g(b_ep_s)
+
+        ax_l = fig.add_subplot(num_examples, 2, i*2 + 1)
+        ax_r = fig.add_subplot(num_examples, 2, i*2 + 2)
+
+        a = np.linalg.norm(a_ag - a_g, axis=1)
+        b = np.linalg.norm(b_ag - b_g, axis=1)
+        diff = np.abs(a - b)
+        ax_l.plot(a, label="A")
+        ax_l.plot(b, label="B")
+        ax_l.plot(-(sim / (sim.max() + 1e-5) * diff.max()), label="sim*")
+        ax_l.plot(-diff, label="diff")
+        ax_l.grid()
+        ax_l.legend()
+
+        a = np.linalg.norm(a_get_ag(a_dtw_s) - a_get_g(a_dtw_s), axis=1)
+        b = np.linalg.norm(b_get_ag(b_dtw_s) - b_get_g(b_dtw_s), axis=1)
+        diff = np.abs(a - b)
+        ax_r.plot(a, label="A")
+        ax_r.plot(b, label="B")
+        ax_r.plot(-(sim_dtw / (sim_dtw.max() + 1e-5) * diff.max()), label="sim*")
+        ax_r.plot(-diff, label="diff")
+        ax_r.grid()
+        ax_r.legend()
+
+    canvas.draw()
+    s, (width, height) = canvas.print_to_buffer()
+    x = np.frombuffer(s, np.uint8).reshape((height, width, 4))
+    writer.add_image(tag='visual_eval', img_tensor=x, global_step=global_step, dataformats='HWC')
+    # import matplotlib.pyplot as plt
+    # plt.figure()
+    # plt.imshow(x)
+    # plt.show()
+
+
 class TwinDataset(Dataset):
 
     def __init__(self, a_episodes: list, b_episodes: list, a_states=None, b_states=None, copy=True):
@@ -457,13 +557,19 @@ class TwinDataset(Dataset):
     def __len__(self):
         return len(self.a_states)
 
-    def split(self, shuffle=True, test_size=0.25, train_size=None, seed=None, copy=False):
+    def split(self, shuffle=True, test_size=0.25, train_size=None, seed=None, copy=False, keep_scalers=True):
         a_train, a_test, b_train, b_test = train_test_split(self.a_episodes, self.b_episodes, test_size=test_size,
                                                             train_size=train_size, shuffle=shuffle, random_state=seed)
-        return (
-            TwinDataset(a_train, b_train, copy=copy),
-            TwinDataset(a_test, b_test, copy=copy),
-        )
+        first = TwinDataset(a_train, b_train, copy=copy)
+        second = TwinDataset(a_test, b_test, copy=copy)
+
+        if keep_scalers:
+            first.a_scaler = deepcopy(self.a_scaler)
+            first.b_scaler = deepcopy(self.b_scaler)
+            second.a_scaler = deepcopy(self.a_scaler)
+            second.b_scaler = deepcopy(self.b_scaler)
+
+        return first, second
 
     @staticmethod
     def merge(dataset1, dataset2):
@@ -514,12 +620,17 @@ class TwinDataset(Dataset):
         if len(self.a_states) == 0 or len(self.b_states) != len(self.a_states):
             self._extract_states()
 
-    def realign(self, distance_fn: Callable):
+    def realign(self, distance_fn: Callable = None, vec_distance_fn: Callable = None):
+        assert distance_fn is None and vec_distance_fn is not None or \
+               distance_fn is not None and vec_distance_fn is None
         self.a_states = []
         self.b_states = []
         for a_ep, b_ep in tqdm(zip(self.a_episodes, self.b_episodes),
                                desc='Aligned episodes', total=len(self.a_episodes)):
-            cost, path = dynamic_time_warping_py(a_ep, b_ep, distance_fn)
+            if distance_fn is not None:
+                cost, path = dynamic_time_warping_py(a_ep, b_ep, distance_fn)
+            else:
+                cost, path = dynamic_time_warping_c(vec_distance_fn(a_ep, b_ep))
             self.a_states += list(a_ep[path[:, 0]])
             self.b_states += list(b_ep[path[:, 1]])
 
@@ -579,7 +690,8 @@ class TwinDataset(Dataset):
 
 def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42, learning_rate=1e-4,
           n_workers=1, n_cycles=50, n_epochs=3, batch_size=128, net_class=None, new_params_each_cycle=False,
-          ae_kwargs=None, z_logvar=0.0, z_size=15):
+          ae_kwargs=None, z_logvar=0.0, z_size=15, loss_weights=None, goal_extractors=None,
+          init_with_goal_based_alignment=False):
 
     checkpoints_dir = local_dir + '/checkpoints'
     os.makedirs(checkpoints_dir, exist_ok=True)
@@ -588,12 +700,15 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
     writer = SummaryWriter(log_dir=local_dir)
 
     ae_kwargs = ae_kwargs or dict()
+    goal_extractors = goal_extractors or dict()
+
     model_config = dict(
         a_spec=dict(input_size=training_set.a_item_size, hidden_size=60, **ae_kwargs),
         b_spec=dict(input_size=training_set.b_item_size, hidden_size=60, **ae_kwargs),
         z_size=z_size,
         net_class=net_class,
         normalize_losses=False,
+        loss_weights=loss_weights,
     )
 
     other_info = dict(
@@ -618,6 +733,26 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
 
     training_set.preprocess()
     test_set.preprocess()
+
+    if init_with_goal_based_alignment:
+
+        a_get_ag = goal_extractors['a_get_ag']
+        a_get_g = goal_extractors['a_get_g']
+        b_get_ag = goal_extractors['b_get_ag']
+        b_get_g = goal_extractors['b_get_g']
+
+        from scipy.spatial.distance import cdist
+
+        def vec_dist(a_ep, b_ep):
+            a_ep = training_set.a_scaler.inverse_transform(a_ep, copy=True)
+            b_ep = training_set.b_scaler.inverse_transform(b_ep, copy=True)
+            a = np.linalg.norm(a_get_ag(a_ep) - a_get_g(a_ep), axis=1)[..., None]
+            b = np.linalg.norm(b_get_ag(b_ep) - b_get_g(b_ep), axis=1)[..., None]
+            res = cdist(a, b).astype(np.float32)
+            return res
+
+        training_set.realign(vec_distance_fn=vec_dist)
+        test_set.realign(vec_distance_fn=vec_dist)
 
     training_data_loader = DataLoader(dataset=training_set, num_workers=n_workers, batch_size=batch_size, shuffle=True)
     test_data_loader = DataLoader(dataset=test_set, num_workers=n_workers, batch_size=batch_size, shuffle=False)
@@ -645,6 +780,9 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
             print('\nEvaluating...')
             _evaluation_step(model, test_data_loader, device, writer=writer, global_step=global_step,
                              fixed_logvar=fixed_logvar)
+
+        _visual_evaluation_step(model, test_set, device, writer=writer, global_step=global_step, cycle_i=cycle,
+                                **goal_extractors)
 
         print('\nSaving checkpoint...')
         model.save(f'{checkpoints_dir}/model_c{cycle}.pt')
@@ -1221,10 +1359,10 @@ if __name__ == '__main__':
     # exit(0)
 
     # _full_dataset = TwinDataset.load('../out/pp_twin_dataset_10k.pkl')
-    _full_dataset = TwinDataset.load('../out/pp_yumi_fetch_twin_dataset_5k.pkl')
-    # _full_dataset = TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl')
-    # _secondary_ds = TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
-    # _full_dataset = TwinDataset.merge(_full_dataset, _secondary_ds)
+    # _full_dataset = TwinDataset.load('../out/pp_yumi_fetch_twin_dataset_5k.pkl')
+    _full_dataset = TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl')
+    _secondary_ds = TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
+    _full_dataset = TwinDataset.merge(_full_dataset, _secondary_ds)
     _full_dataset.normalize()
 
     # _test_dwt_on_dataset(_full_dataset)
@@ -1265,8 +1403,20 @@ if __name__ == '__main__':
     train(
         training_set=_training_set,
         test_set=_test_set,
-        local_dir='../out/twin_yumi_fetch_ae_resets',
+        local_dir='../out/twin_yumi_hand_ae_resets_REMOVE',
         net_class=SimpleAutoencoder,
         new_params_each_cycle=True,
         n_epochs=20,
+        loss_weights=dict(
+            a=(1. / _training_set.a_item_size),
+            b=(1. / _training_set.b_item_size),
+            sim=2.0,
+        ),
+        goal_extractors=dict(
+            a_get_ag=lambda x: x[:, 18:21],
+            b_get_ag=lambda x: x[:, 63:66],
+            a_get_g=lambda x: x[0, -3:],
+            b_get_g=lambda x: x[0, -7:-4],
+        ),
+        init_with_goal_based_alignment=True,
     )
