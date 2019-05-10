@@ -182,19 +182,29 @@ def _run_test2():
 
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
+    import dtw_c
 
     x = np.r_[0, 0, 0, 0, 1, 1, 2, 2, 3, 2, 1, 1, 0, 0, 0, 0]
     y = np.r_[0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 2, 2, 1, 1, 0, 0]
+
+    all_dists = np.zeros((len(x), len(y)), dtype=np.float32)
+    for i in range(len(x)):
+        all_dists[i] = np.abs(x[i] - y)
+    cost_c, path_c = dtw_c.dynamic_time_warping_c(all_dists)
+
     cost_m, path_m = dynamic_time_warping(x, y, lambda x_, y_: np.abs(x_ - y_))
     cost, path = _dtw_pierre_rouanet(x, y, lambda x_, y_: np.abs(x_ - y_))[2:4]
 
-    fig, axes = plt.subplots(2, 1, sharex='col')
+    fig, axes = plt.subplots(3, 1, sharex='col')
 
     axes[0].imshow(cost.T, origin='lower', cmap=cm.gray, interpolation='nearest')
     axes[0].plot(path[0], path[1], 'w')
 
     axes[1].imshow(cost_m.T, origin='lower', cmap=cm.gray, interpolation='nearest')
     axes[1].plot(*path_m.T, 'w')
+
+    axes[2].imshow(cost_c.T, origin='lower', cmap=cm.gray, interpolation='nearest')
+    axes[2].plot(*path_c.T, 'w')
     plt.show()
 
 
