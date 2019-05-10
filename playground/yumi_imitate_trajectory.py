@@ -9,14 +9,22 @@ import _thesis_modules
 from playground.twin_vae import TwinVAE, TwinDataset, SimpleAutoencoder, VAE
 
 
-def _controller(s_obs_, t_obs_, prev_s_u_, s_action_space_) -> np.ndarray:
+def _controller(s_obs_, t_obs_, prev_s_u_, s_action_space_, yumi_env_version=2) -> np.ndarray:
     u = np.zeros(s_action_space_.shape)
     pos_err = t_obs_[:3] - s_obs_[:3]
     t_g_dist = np.linalg.norm(t_obs_[6:9] - t_obs_[9:12], ord=2)
     # s_g_dist = np.linalg.norm(s_obs_['observation'][6:9] - s_obs_['observation'][9:12], ord=2)
     # g_dist_err = t_g_dist - s_g_dist
-    u[1:4] = pos_err * 5.0
-    u[0] = np.interp(t_g_dist, [0.05, 0.30], [-1, 1]) * 1.2
+    if yumi_env_version == 2:
+        pos_k = 10.0
+        grasp_k = 1.0
+        grasp_range = [0.05, 0.20]
+    else:
+        pos_k = 5.0
+        grasp_k = 1.2
+        grasp_range = [0.05, 0.30]
+    u[1:4] = pos_err * pos_k
+    u[0] = np.interp(t_g_dist, grasp_range, [-1, 1]) * grasp_k
     return np.clip(u, -1, 1)
 
 
@@ -26,14 +34,18 @@ def _flatten_obs(obs_dict):
 
 def yumi_to_yumi():
 
+    env_v = 2
+
     teacher_env = gym.make(
-        'YumiConstrained-v1',
-        reward_type='sparse'
+        f'YumiConstrained-v{env_v}',
+        reward_type='sparse',
+        render_poses=False,
     )
 
     student_env = gym.make(
-        'YumiConstrained-v1',
-        reward_type='sparse'
+        f'YumiConstrained-v{env_v}',
+        reward_type='sparse',
+        render_poses=False,
     )
 
     teacher = YumiConstrainedAgent(teacher_env)
@@ -60,7 +72,7 @@ def yumi_to_yumi():
         t_u = teacher.predict(t_obs)
         t_obs, _, done, _ = teacher_env.step(t_u)
 
-        s_u = _controller(s_obs['observation'], t_obs['observation'], prev_s_u, student_env.action_space)
+        s_u = _controller(s_obs['observation'], t_obs['observation'], prev_s_u, student_env.action_space, env_v)
         prev_s_u = s_u.copy()
         s_obs = student_env.step(s_u)[0]
 
@@ -73,16 +85,23 @@ def hand_to_yumi():
     # model = TwinVAE.load('../out/pp_and_reach_yumi_twin_ae_test_z15/checkpoints/model_c49.pt',
     #                      net_class=SimpleAutoencoder)
 
-    model = TwinVAE.load('../out/twin_ae_kdl_test/checkpoints/model_c12.pt',
+    # model = TwinVAE.load('../out/twin_ae_kdl_test/checkpoints/model_c12.pt',
+    #                      net_class=SimpleAutoencoder)
+
+    # model = TwinVAE.load('../out/twin_yumi_hand_ae_resets/checkpoints/model_c6.pt',
+    #                      net_class=SimpleAutoencoder)
+
+    model = TwinVAE.load('../out/twin_yumi_hand_ae_resets_goal_init/checkpoints/model_c14.pt',
                          net_class=SimpleAutoencoder)
 
     # model = TwinVAE.load('../out/twin_vae_resets_test/checkpoints/model_c5.pt',
     #                      net_class=VAE)
 
-    dataset = TwinDataset.merge(
-        TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl'),
-        TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
-    )
+    dataset = TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl')
+    # dataset = TwinDataset.merge(
+    #     TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl'),
+    #     TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
+    # )
     dataset.normalize()
 
     teacher_env = gym.make(
@@ -90,14 +109,15 @@ def hand_to_yumi():
         ignore_rotation_ctrl=True,
         ignore_target_rotation=True,
         success_on_grasp_only=False,
-        randomize_initial_arm_pos=True,
+        randomize_initial_arm_pos=False,
         randomize_initial_object_pos=True,
         object_id='box'
     )
 
     student_env = gym.make(
         'YumiConstrained-v1',
-        reward_type='sparse'
+        reward_type='sparse',
+        render_poses=False,
     )
 
     teacher = HandPickAndPlaceAgent(teacher_env)
@@ -140,7 +160,7 @@ def hand_to_yumi():
         recon_t_obs = model.cross_decode_b_to_a(b_obs)
         recon_t_obs = dataset.a_scaler.inverse_transform(recon_t_obs[None], copy=True)[0]
 
-        s_u = _controller(s_obs['observation'], recon_t_obs, prev_s_u, student_env.action_space)
+        s_u = _controller(s_obs['observation'], recon_t_obs, prev_s_u, student_env.action_space, yumi_env_version=1)
         prev_s_u = s_u.copy()
         s_obs = student_env.step(s_u)[0]
 
@@ -163,7 +183,8 @@ def fetch_to_yumi():
 
     student_env = gym.make(
         'YumiConstrained-v1',
-        reward_type='sparse'
+        reward_type='sparse',
+        render_poses=False,
     )
 
     teacher = FetchPickAndPlaceAgent(teacher_env)
@@ -206,7 +227,7 @@ def fetch_to_yumi():
         recon_t_obs = model.cross_decode_b_to_a(b_obs)
         recon_t_obs = dataset.a_scaler.inverse_transform(recon_t_obs[None], copy=True)[0]
 
-        s_u = _controller(s_obs['observation'], recon_t_obs, prev_s_u, student_env.action_space)
+        s_u = _controller(s_obs['observation'], recon_t_obs, prev_s_u, student_env.action_space, yumi_env_version=1)
         prev_s_u = s_u.copy()
         s_obs = student_env.step(s_u)[0]
 
@@ -215,4 +236,6 @@ def fetch_to_yumi():
 
 
 if __name__ == '__main__':
+    # yumi_to_yumi()
+    # fetch_to_yumi()
     hand_to_yumi()
