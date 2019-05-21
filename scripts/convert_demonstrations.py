@@ -4,7 +4,7 @@ import numpy as np
 import gym
 
 
-def her_torch_to_sb(input_file: str, output_file: str, goal_env: gym.GoalEnv):
+def her_torch_to_sb(input_file: str, output_file: str, goal_env: gym.GoalEnv=None, reward_fn=None):
 
     assert input_file.endswith('.pkl')
     assert output_file.endswith('.npz')
@@ -24,7 +24,12 @@ def her_torch_to_sb(input_file: str, output_file: str, goal_env: gym.GoalEnv):
     n_episodes, ep_len, action_size = data['mb_actions'].shape
     obs_size = data['mb_obs'].shape[-1] + data['mb_g'].shape[-1]
 
-    rewards = goal_env.compute_reward(data['mb_ag'][:, 1:], data['mb_g'], info=dict())
+    if callable(reward_fn):
+        assert goal_env is None
+    else:
+        assert reward_fn is None
+        reward_fn = goal_env.compute_reward
+    rewards = reward_fn(data['mb_ag'][:, 1:], data['mb_g'], info=dict())
     episode_starts = np.zeros(ep_len * n_episodes, dtype=np.bool)
     episode_starts[::ep_len] = True
 
@@ -93,19 +98,43 @@ def _generate_expert_traj(model, env=None, n_episodes=3):
 
 if __name__ == '__main__':
 
-    env = gym.make(
-        'HandPickAndPlace-v0',
-        ignore_rotation_ctrl=True,
-        ignore_target_rotation=True,
-        randomize_initial_arm_pos=True,
-        randomize_initial_object_pos=True,
-        distance_threshold=0.05,
-        object_id='small_sphere',
-        reward_type='dense',
-    )
+    # env = gym.make(
+    #     'HandPickAndPlace-v0',
+    #     ignore_rotation_ctrl=True,
+    #     ignore_target_rotation=True,
+    #     randomize_initial_arm_pos=True,
+    #     randomize_initial_object_pos=True,
+    #     distance_threshold=0.05,
+    #     object_id='small_sphere',
+    #     reward_type='dense',
+    # )
+    #
+    # her_torch_to_sb(
+    #     input_file='../../misc/hindsight-experience-replay/demonstrations/hand_demo_500_small_sphere.pkl',
+    #     output_file='../demonstrations/stable_baselines/hand_demo_dense_500_small_sphere.npz',
+    #     goal_env=env.unwrapped
+    # )
+
+    # env = gym.make('YumiLift-v1', randomize_initial_object_pos=False)
+    #
+    # def custom_rew_fn(achieved_goal, *args, **kwargs):
+    #     idx = achieved_goal > 0.01
+    #     rew = np.zeros_like(achieved_goal)
+    #     # rew[:] = -0.05
+    #     rew[idx] = (achieved_goal[idx] - 0.01) ** 0.1
+    #     return rew
+    #
+    # her_torch_to_sb(
+    #     input_file='../../misc/hindsight-experience-replay/demonstrations/yumi_lift_700_fixed.pkl',
+    #     output_file='../demonstrations/stable_baselines/yumi_lift_700_fixed_cr3.npz',
+    #     # goal_env=env.unwrapped,
+    #     reward_fn=custom_rew_fn,
+    # )
+
+    env = gym.make('YumiReachTwoArms-v1', reward_type='dense')
 
     her_torch_to_sb(
-        input_file='../../misc/hindsight-experience-replay/demonstrations/hand_demo_500_small_sphere.pkl',
-        output_file='../demonstrations/stable_baselines/hand_demo_dense_500_small_sphere.npz',
-        goal_env=env.unwrapped
+        input_file='../../misc/hindsight-experience-replay/demonstrations/yumi_reach_two_arms_700.pkl',
+        output_file='../demonstrations/stable_baselines/yumi_reach_two_arms_700.npz',
+        goal_env=env.unwrapped,
     )
