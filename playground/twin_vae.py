@@ -798,7 +798,7 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
             model.reset_parameters()
 
 
-def _generate_twin_episodes(n=1_000, max_ep_steps=200, seed=42, render=False):
+def _generate_twin_episodes(n=1_000, max_ep_steps=200, seed=42, render=False, **kwargs):
 
     import gym
     from gym.envs.robotics import FetchPickAndPlaceEnv
@@ -894,7 +894,7 @@ def _generate_twin_episodes(n=1_000, max_ep_steps=200, seed=42, render=False):
     return a_episodes, b_episodes
 
 
-def _generate_twin_episodes_yumi(n=1_000, max_ep_steps=200, seed=42, render=False):
+def _generate_twin_episodes_yumi(n=1_000, max_ep_steps=200, seed=42, render=False, **kwargs):
 
     import gym
     from gym.envs.yumi import YumiConstrainedEnv
@@ -907,7 +907,7 @@ def _generate_twin_episodes_yumi(n=1_000, max_ep_steps=200, seed=42, render=Fals
         return np.r_[obs_dict['observation'], obs_dict['desired_goal']]
 
     a_env = gym.make(
-        'YumiConstrained-v1'
+        'YumiConstrained-v2'
     ).unwrapped # type: YumiConstrainedEnv
 
     b_env = gym.make(
@@ -915,7 +915,7 @@ def _generate_twin_episodes_yumi(n=1_000, max_ep_steps=200, seed=42, render=Fals
         ignore_rotation_ctrl=True,
         ignore_target_rotation=True,
         success_on_grasp_only=False,
-        randomize_initial_arm_pos=True,
+        randomize_initial_arm_pos=False,
         randomize_initial_object_pos=True,
         object_id='box'
     ).unwrapped # type: HandPickAndPlaceEnv
@@ -988,15 +988,19 @@ def _generate_twin_episodes_yumi(n=1_000, max_ep_steps=200, seed=42, render=Fals
                 break
 
         if success:
-            prog.update()
-            a_episodes.append(np.array(a_states))
-            b_episodes.append(np.array(b_states))
+            b = np.array(b_states)
+            b_traj = np.linalg.norm(b[:, 63:66] - b[:, -7:-4], axis=1)
+            b_traj_mean_grad = np.gradient(b_traj).mean()
+            if b_traj_mean_grad < -0.002:
+                prog.update()
+                a_episodes.append(np.array(a_states))
+                b_episodes.append(np.array(b_states))
 
     prog.close()
     return a_episodes, b_episodes
 
 
-def _generate_twin_episodes_yumi_reach(n=1_000, max_ep_steps=80, seed=42, render=False):
+def _generate_twin_episodes_yumi_reach(n=1_000, max_ep_steps=80, seed=42, render=False, **kwargs):
 
     import gym
     from gym.envs.yumi import YumiConstrainedEnv
@@ -1126,7 +1130,8 @@ def _generate_twin_episodes_yumi_reach(n=1_000, max_ep_steps=80, seed=42, render
     return a_episodes, b_episodes
 
 
-def _generate_twin_episodes_yumi_and_fetch(n=1_000, max_ep_steps=200, seed=42, render=False):
+def _generate_twin_episodes_yumi_and_fetch(n=1_000, max_ep_steps=200, seed=42, render=False,
+                                           early_termination=True, **kwargs):
 
     import gym
     from gym.envs.yumi import YumiConstrainedEnv
@@ -1139,7 +1144,7 @@ def _generate_twin_episodes_yumi_and_fetch(n=1_000, max_ep_steps=200, seed=42, r
         return np.r_[obs_dict['observation'], obs_dict['desired_goal']]
 
     a_env = gym.make(
-        'YumiConstrained-v1'
+        'YumiConstrained-v2'
     ).unwrapped # type: YumiConstrainedEnv
 
     b_env = gym.make(
@@ -1207,7 +1212,7 @@ def _generate_twin_episodes_yumi_and_fetch(n=1_000, max_ep_steps=200, seed=42, r
                 b_env.render()
 
             success = a_info['is_success'] == 1.0 and b_info['is_success'] == 1.0
-            if success:
+            if early_termination and success:
                 break
 
             if a_done or b_done:
@@ -1222,9 +1227,11 @@ def _generate_twin_episodes_yumi_and_fetch(n=1_000, max_ep_steps=200, seed=42, r
     return a_episodes, b_episodes
 
 
-def _generate_twin_dataset(file_path, n=1_000, max_ep_steps=200, seed=42, render=False, generator=None):
+def _generate_twin_dataset(file_path, n=1_000, max_ep_steps=200, seed=42, render=False, generator=None,
+                           early_termination=True):
     generator = generator or _generate_twin_episodes
-    a_episodes, b_episodes = generator(n=n, max_ep_steps=max_ep_steps, seed=seed, render=render)
+    a_episodes, b_episodes = generator(n=n, max_ep_steps=max_ep_steps, seed=seed,
+                                       render=render, early_termination=early_termination)
     dataset = TwinDataset(a_episodes=a_episodes, b_episodes=b_episodes, copy=False)
     dataset.save(file_path, with_aligned_states=False)
 
@@ -1352,17 +1359,20 @@ if __name__ == '__main__':
     # _generate_twin_dataset(file_path='../out/pp_twin_dataset_10k.pkl', n=10_000, render=False)
     # _generate_twin_dataset(file_path='../out/pp_yumi_twin_dataset_3k.pkl', n=3_000, render=False,
     #                        generator=_generate_twin_episodes_yumi, max_ep_steps=110)
+    # _generate_twin_dataset(file_path='../out/pp_yumi_hand_fixed_twin_dataset_5k.pkl', n=5_000, render=False,
+    #                        generator=_generate_twin_episodes_yumi, max_ep_steps=70, seed=1042)
     # _generate_twin_dataset(file_path='../out/pp_reach_yumi_twin_dataset_2k.pkl', n=2_000, render=False,
     #                        generator=_generate_twin_episodes_yumi_reach, max_ep_steps=80)
-    # _generate_twin_dataset(file_path='../out/pp_yumi_fetch_twin_dataset_5k.pkl', n=5_000, render=False,
-    #                        generator=_generate_twin_episodes_yumi_and_fetch, max_ep_steps=80)
+    # _generate_twin_dataset(file_path='../out/pp_yumi_v2_fetch_twin_dataset_10k.pkl', n=10_000, render=False,
+    #                        generator=_generate_twin_episodes_yumi_and_fetch, max_ep_steps=50, early_termination=False)
     # exit(0)
 
     # _full_dataset = TwinDataset.load('../out/pp_twin_dataset_10k.pkl')
     # _full_dataset = TwinDataset.load('../out/pp_yumi_fetch_twin_dataset_5k.pkl')
-    _full_dataset = TwinDataset.load('../out/pp_yumi_twin_dataset_3k.pkl')
-    _secondary_ds = TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
-    _full_dataset = TwinDataset.merge(_full_dataset, _secondary_ds)
+    # _full_dataset = TwinDataset.load('../out/pp_yumi_hand_fixed_twin_dataset_3k.pkl')
+    _full_dataset = TwinDataset.load('../out/pp_yumi_v2_fetch_twin_dataset_10k.pkl')
+    # _secondary_ds = TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
+    # _full_dataset = TwinDataset.merge(_full_dataset, _secondary_ds)
     _full_dataset.normalize()
 
     # _test_dwt_on_dataset(_full_dataset)
@@ -1395,7 +1405,7 @@ if __name__ == '__main__':
 
     _training_set, _test_set = _full_dataset.split(
         shuffle=True,
-        test_size=0.25,
+        test_size=0.20,
         train_size=None,
         seed=42,
     )
@@ -1403,10 +1413,10 @@ if __name__ == '__main__':
     train(
         training_set=_training_set,
         test_set=_test_set,
-        local_dir='../out/twin_yumi_hand_ae_resets_REMOVE',
+        local_dir='../out/twin_yumi_v2_fetch_ae_resets_new_l',
         net_class=SimpleAutoencoder,
         new_params_each_cycle=True,
-        n_epochs=20,
+        n_epochs=80,
         loss_weights=dict(
             a=(1. / _training_set.a_item_size),
             b=(1. / _training_set.b_item_size),
@@ -1414,9 +1424,9 @@ if __name__ == '__main__':
         ),
         goal_extractors=dict(
             a_get_ag=lambda x: x[:, 18:21],
-            b_get_ag=lambda x: x[:, 63:66],
+            b_get_ag=lambda x: x[:, 3:6],
             a_get_g=lambda x: x[0, -3:],
             b_get_g=lambda x: x[0, -7:-4],
         ),
-        init_with_goal_based_alignment=True,
+        init_with_goal_based_alignment=False,
     )
