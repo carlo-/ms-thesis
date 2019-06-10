@@ -691,7 +691,7 @@ class TwinDataset(Dataset):
 def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, seed=42, learning_rate=1e-4,
           n_workers=1, n_cycles=50, n_epochs=3, batch_size=128, net_class=None, new_params_each_cycle=False,
           ae_kwargs=None, z_logvar=0.0, z_size=15, loss_weights=None, goal_extractors=None,
-          init_with_goal_based_alignment=False):
+          init_with_goal_based_alignment=False, hidden_size=60, imitator_eval_step=None):
 
     checkpoints_dir = local_dir + '/checkpoints'
     os.makedirs(checkpoints_dir, exist_ok=True)
@@ -703,8 +703,8 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
     goal_extractors = goal_extractors or dict()
 
     model_config = dict(
-        a_spec=dict(input_size=training_set.a_item_size, hidden_size=60, **ae_kwargs),
-        b_spec=dict(input_size=training_set.b_item_size, hidden_size=60, **ae_kwargs),
+        a_spec=dict(input_size=training_set.a_item_size, hidden_size=hidden_size, **ae_kwargs),
+        b_spec=dict(input_size=training_set.b_item_size, hidden_size=hidden_size, **ae_kwargs),
         z_size=z_size,
         net_class=net_class,
         normalize_losses=False,
@@ -785,7 +785,18 @@ def train(*, training_set: TwinDataset, test_set: TwinDataset, local_dir: str, s
                                 **goal_extractors)
 
         print('\nSaving checkpoint...')
-        model.save(f'{checkpoints_dir}/model_c{cycle}.pt')
+        latest_model_path = f'{checkpoints_dir}/model_c{cycle}.pt'
+        model.save(latest_model_path)
+
+        if callable(imitator_eval_step):
+            print('\nEvaluating imitator...')
+            imitator_eval_step(
+                model_path=latest_model_path,
+                model_class=net_class,
+                dataset=training_data_loader.dataset,
+                writer=writer,
+                global_step=global_step,
+            )
 
         print('Realigning test dataset...')
         test_set.realign_with_model(model)
@@ -1140,11 +1151,14 @@ def _generate_twin_episodes_yumi_and_fetch(n=1_000, max_ep_steps=200, seed=42, r
     from gym.agents.fetch import FetchPickAndPlaceAgent
     from gym.utils import transformations as tf
 
+    check_contacts = True
+
     def flatten_obs(obs_dict):
         return np.r_[obs_dict['observation'], obs_dict['desired_goal']]
 
     a_env = gym.make(
-        'YumiConstrained-v2'
+        'YumiConstrained-v2',
+        extended_bounds=True,
     ).unwrapped # type: YumiConstrainedEnv
 
     b_env = gym.make(
@@ -1162,7 +1176,7 @@ def _generate_twin_episodes_yumi_and_fetch(n=1_000, max_ep_steps=200, seed=42, r
     prog = tqdm(total=n, desc='Recorded episodes')
 
     a_table_tf = a_env.get_table_surface_pose()
-    b_table_tf = gym.make('HandPickAndPlace-v0').unwrapped.get_table_surface_pose()
+    b_table_tf = b_env.get_table_surface_pose()
 
     while len(a_episodes) < n:
 
@@ -1212,6 +1226,11 @@ def _generate_twin_episodes_yumi_and_fetch(n=1_000, max_ep_steps=200, seed=42, r
                 b_env.render()
 
             success = a_info['is_success'] == 1.0 and b_info['is_success'] == 1.0
+
+            if check_contacts and success:
+                contacts = a_env.sim_env.get_object_contact_points()
+                success = len(contacts) >= 2
+
             if early_termination and success:
                 break
 
@@ -1355,6 +1374,60 @@ def _test_sim_loss(dataset: TwinDataset, model: TwinVAE, a_get_ag, a_get_g, b_ge
         plt.show()
 
 
+def _imitator_eval_step_from_fetch(*, model_path, model_class, dataset, n_episodes=300, writer: SummaryWriter = None,
+                                   global_step: int = None, render=False, seed=42):
+
+    import gym
+    from gym.agents.fetch import FetchPickAndPlaceAgent, FetchPushAgent
+    from gym.agents.yumi import YumiImitatorAgent
+
+    model = TwinVAE.load(model_path, net_class=model_class)
+
+    teacher_env = gym.make(
+        'FetchPickAndPlace-v1',
+        reward_type='sparse',
+    )
+
+    student_env = gym.make(
+        'YumiConstrained-v2',
+        reward_type='sparse',
+        render_poses=False,
+        object_on_table=False,
+    )
+
+    teacher_env.seed(seed)
+    student_env.seed(seed)
+
+    teacher = FetchPickAndPlaceAgent(teacher_env)
+    # teacher = FetchPushAgent(teacher_env)
+    agent = YumiImitatorAgent(student_env, teacher_env=teacher_env, teacher_agent=teacher, a_scaler=dataset.a_scaler,
+                              b_scaler=dataset.b_scaler, model=model)
+
+    n_successes = 0
+    for _ in tqdm(range(n_episodes), desc='Episodes evaluated'):
+        done = False
+        obs = student_env.reset()
+        agent.reset()
+
+        while not done:
+            u = agent.predict(obs)
+            obs, rew, done, info = student_env.step(u)
+
+            if render:
+                student_env.render()
+                teacher_env.render()
+
+            if info['is_success'] == 1:
+                n_successes += 1
+                done = True
+
+    success_rate = n_successes / n_episodes
+    print('====> Imitator success rate: {:.4f}'.format(success_rate))
+
+    if writer is not None:
+        writer.add_scalar(tag='imitation_success_rate', scalar_value=success_rate, global_step=global_step)
+
+
 if __name__ == '__main__':
     # _generate_twin_dataset(file_path='../out/pp_twin_dataset_10k.pkl', n=10_000, render=False)
     # _generate_twin_dataset(file_path='../out/pp_yumi_twin_dataset_3k.pkl', n=3_000, render=False,
@@ -1365,15 +1438,27 @@ if __name__ == '__main__':
     #                        generator=_generate_twin_episodes_yumi_reach, max_ep_steps=80)
     # _generate_twin_dataset(file_path='../out/pp_yumi_v2_fetch_twin_dataset_10k.pkl', n=10_000, render=False,
     #                        generator=_generate_twin_episodes_yumi_and_fetch, max_ep_steps=50, early_termination=False)
+    # _generate_twin_dataset(file_path='../out/pp_yumi_v2_fetch_ext_bounds_twin_dataset_15k.pkl', n=15_000,render=False,
+    #                        generator=_generate_twin_episodes_yumi_and_fetch, max_ep_steps=50, early_termination=False)
     # exit(0)
 
     # _full_dataset = TwinDataset.load('../out/pp_twin_dataset_10k.pkl')
     # _full_dataset = TwinDataset.load('../out/pp_yumi_fetch_twin_dataset_5k.pkl')
     # _full_dataset = TwinDataset.load('../out/pp_yumi_hand_fixed_twin_dataset_3k.pkl')
-    _full_dataset = TwinDataset.load('../out/pp_yumi_v2_fetch_twin_dataset_10k.pkl')
+    # _full_dataset = TwinDataset.load('../out/pp_yumi_v2_fetch_twin_dataset_10k.pkl')
+    _full_dataset = TwinDataset.load('../out/pp_yumi_v2_fetch_ext_bounds_twin_dataset_15k.pkl')
     # _secondary_ds = TwinDataset.load('../out/pp_reach_yumi_twin_dataset_2k.pkl')
     # _full_dataset = TwinDataset.merge(_full_dataset, _secondary_ds)
     _full_dataset.normalize()
+
+    # _imitator_eval_step_from_fetch(
+    #     model_path='../out/twin_yumi_v2_fetch_ae_resets_new_l/checkpoints/model_c1.pt',
+    #     model_class=SimpleAutoencoder,
+    #     dataset=_full_dataset,
+    #     n_episodes=100,
+    #     render=False
+    # )
+    # exit(0)
 
     # _test_dwt_on_dataset(_full_dataset)
     # exit(0)
@@ -1405,7 +1490,7 @@ if __name__ == '__main__':
 
     _training_set, _test_set = _full_dataset.split(
         shuffle=True,
-        test_size=0.20,
+        test_size=1_000,
         train_size=None,
         seed=42,
     )
@@ -1413,7 +1498,7 @@ if __name__ == '__main__':
     train(
         training_set=_training_set,
         test_set=_test_set,
-        local_dir='../out/twin_yumi_v2_fetch_ae_resets_new_l',
+        local_dir='../out/twin_yumi_v2_fetch_ae_resets_ext_bounds2',
         net_class=SimpleAutoencoder,
         new_params_each_cycle=True,
         n_epochs=80,
@@ -1429,4 +1514,5 @@ if __name__ == '__main__':
             b_get_g=lambda x: x[0, -7:-4],
         ),
         init_with_goal_based_alignment=False,
+        imitator_eval_step=_imitator_eval_step_from_fetch,
     )
